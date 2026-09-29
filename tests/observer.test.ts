@@ -197,6 +197,47 @@ describe("Observer", () => {
     expect(evidence[0].evidenceType).toBe("command")
   })
 
+  test("detects and blocks a successful write loop for one file", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-write-loop"
+    await observer.event({
+      event: {
+        type: "session.created",
+        properties: { info: { id: sessionId, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+      },
+    })
+
+    for (const content of ["version one", "version two", "version three"]) {
+      await observer["tool.execute.after"]({
+        tool: "write", sessionID: sessionId, callID: `write-${content}`, args: { filePath: "src/collector_async.py", content },
+      }, { title: "write file", output: "updated", metadata: {} })
+    }
+    storage.flushBatch()
+
+    const warning = storage.getDevEvents("tool_rejected").find((event) => String(event.metadata?.reason) === "successful_edit_loop_warning")
+    expect(warning?.filePath).toBe("src/collector_async.py")
+    expect(warning?.metadata?.repeats).toBe(3)
+
+    const permission = { status: "ask" as const }
+    await observer["permission.ask"]({
+      id: "permission-write-loop", type: "write", pattern: "src/collector_async.py",
+      sessionID: sessionId, messageID: "message-loop", title: "Rewrite file", metadata: {},
+    }, permission)
+    expect(permission.status).toBe("deny")
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "write", sessionID: sessionId, callID: "write-blocked" },
+        { args: { filePath: "src/collector_async.py", content: "version four" } },
+      )
+    } catch (error) {
+      blocked = true
+      expect(String(error)).toContain("остановлена повторная запись")
+    }
+    expect(blocked).toBe(true)
+  })
+
   test("emits a preflight warning for an edit outside the active contract", async () => {
     const { storage, observer } = createObserverFixture()
     const sessionId = "observer-session-preflight"

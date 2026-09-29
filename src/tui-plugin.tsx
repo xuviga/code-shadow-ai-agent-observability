@@ -455,7 +455,7 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
 
             {/* ─── INFO LINE ─── */}
             <box flexDirection="row" justifyContent="space-between" padding={[0, 0]}>
-              <text fg={s.muted}>v0.5.0 · {proj()}</text>
+              <text fg={s.muted}>v0.5.1 · {proj()}</text>
             </box>
 
             <text fg={s.border}>{DIVIDER}</text>

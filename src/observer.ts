@@ -11,6 +11,7 @@ import type { ShadowConfig } from "./types"
 import { NodeType } from "./types"
 import { sanitizeContent } from "./config"
 import type { createLogger } from "./logger"
+import * as path from "node:path"
 
 // ---------------------------------------------------------------------------
 // Минимальный интерфейс StorageEngine — только те методы, которые реально
@@ -85,6 +86,32 @@ const toolStartTimes = new Map<string, number>()
 /** Same failing tool signature repeated in one session. */
 const toolLoopMap = new Map<string, { count: number; lastStatus: string }>()
 
+/**
+ * Successful write/edit operations repeated for one file in one session.
+ * A successful tool call is not proof of progress: an agent can rewrite the
+ * same file forever while every individual operation technically succeeds.
+ */
+type SuccessfulEditLoopState = {
+  count: number
+  firstAt: number
+  lastAt: number
+  fingerprints: Set<string>
+  warned: boolean
+  blocked: boolean
+}
+
+const successfulEditLoopMap = new Map<string, SuccessfulEditLoopState>()
+const SUCCESSFUL_EDIT_LOOP_WINDOW_MS = 10 * 60 * 1000
+const SUCCESSFUL_EDIT_LOOP_WARNING_COUNT = 3
+const SUCCESSFUL_EDIT_LOOP_BLOCK_COUNT = 3
+
+class SuccessfulEditLoopGuardError extends Error {
+  constructor(filePath: string, count: number) {
+    super(`[Code Shadow] остановлена повторная запись ${filePath}: ${count} успешных write/edit за короткий интервал. Проверь root cause, текущий diff и следующий шаг задачи.`)
+    this.name = "SuccessfulEditLoopGuardError"
+  }
+}
+
 /** Dedup-кэш для авто-сохранения: ключ → timestamp последней записи */
 const autoMemCache = new Map<string, number>()
 const AUTO_MEM_DEDUP_MS = 5 * 60 * 1000 // 5 минут
@@ -122,6 +149,25 @@ function hashContent(content: string): string {
     hash = hash & hash // Конвертация в 32-битное целое
   }
   return hash.toString(16)
+}
+
+function normalizeTrackedPath(filePath: string): string {
+  return path.normalize(filePath).replace(/[\\/]+/g, path.sep).toLowerCase()
+}
+
+function isMutatingFileTool(toolName: string): boolean {
+  return /^(write|edit)$/i.test(toolName)
+}
+
+function getEditFingerprint(toolName: string, args: Record<string, unknown>): string | null {
+  const content = toolName.toLowerCase() === "write"
+    ? args.content
+    : args.newString ?? args.content ?? args.diff
+  return typeof content === "string" && content.length > 0 ? hashContent(content) : null
+}
+
+function successfulEditLoopKey(sessionId: string, filePath: string): string {
+  return `${sessionId}:${normalizeTrackedPath(filePath)}`
 }
 
 /**
@@ -721,6 +767,16 @@ export function createObserver(
       if (!session) return
       const targets = Array.isArray(input.pattern) ? input.pattern : input.pattern ? [input.pattern] : []
       if (targets.length === 0) return
+
+      for (const target of targets) {
+        const loopState = getRecentSuccessfulEditState(input.sessionID, target)
+        if (loopState && loopState.count >= SUCCESSFUL_EDIT_LOOP_BLOCK_COUNT) {
+          rejectSuccessfulEditLoop(input.sessionID, target, input.type, loopState)
+          output.status = "deny"
+          return
+        }
+      }
+
       const contracts = storage.getDb().prepare(`SELECT id, allowed_paths, forbidden_paths FROM change_contracts WHERE project_root = ?1 AND status = 'active'`).all(session.projectRoot) as Array<{ id: string; allowed_paths: string; forbidden_paths: string }>
       const matches = (pattern: string, value: string) => pattern === "*" || value === pattern || value.startsWith(pattern.replace(/[*]$/, ""))
       for (const contract of contracts) {
@@ -813,6 +869,95 @@ export function createObserver(
       )
       log.warn(`Agent loop detected: ${toolName} повторён 3 раза с ошибкой; task=${activeTask?.id || "none"}`)
     }
+  }
+
+  function getRecentSuccessfulEditState(sessionId: string, filePath: string, now = Date.now()): SuccessfulEditLoopState | undefined {
+    const key = successfulEditLoopKey(sessionId, filePath)
+    const state = successfulEditLoopMap.get(key)
+    if (!state) return undefined
+    if (now - state.lastAt > SUCCESSFUL_EDIT_LOOP_WINDOW_MS) {
+      successfulEditLoopMap.delete(key)
+      return undefined
+    }
+    return state
+  }
+
+  function recordSuccessfulEdit(
+    toolName: string,
+    sessionId: string,
+    filePath: string,
+    args: Record<string, unknown>,
+  ): SuccessfulEditLoopState {
+    const now = Date.now()
+    const key = successfulEditLoopKey(sessionId, filePath)
+    let state = getRecentSuccessfulEditState(sessionId, filePath, now)
+    if (!state) {
+      state = { count: 0, firstAt: now, lastAt: now, fingerprints: new Set<string>(), warned: false, blocked: false }
+      successfulEditLoopMap.set(key, state)
+    }
+
+    state.count += 1
+    state.lastAt = now
+    const fingerprint = getEditFingerprint(toolName, args)
+    if (fingerprint) state.fingerprints.add(fingerprint)
+
+    if (state.count === SUCCESSFUL_EDIT_LOOP_WARNING_COUNT && !state.warned) {
+      state.warned = true
+      storage.enqueue("developer_events", {
+        event_type: "tool_rejected",
+        session_id: sessionId,
+        file_path: filePath,
+        metadata: JSON.stringify({
+          reason: "successful_edit_loop_warning",
+          tool: toolName,
+          file: filePath,
+          repeats: state.count,
+          unique_contents: state.fingerprints.size,
+          window_ms: SUCCESSFUL_EDIT_LOOP_WINDOW_MS,
+        }),
+        timestamp: now,
+      })
+      log.warn(`Successful edit loop warning: ${filePath} переписан ${state.count} раз за ${Math.round((now - state.firstAt) / 1000)}с`)
+    }
+
+    return state
+  }
+
+  function rejectSuccessfulEditLoop(
+    sessionId: string,
+    filePath: string,
+    toolName: string,
+    state: SuccessfulEditLoopState,
+  ): void {
+    if (state.blocked) return
+    state.blocked = true
+    storage.enqueue("developer_events", {
+      event_type: "tool_rejected",
+      session_id: sessionId,
+      file_path: filePath,
+      metadata: JSON.stringify({
+        reason: "successful_edit_loop_blocked",
+        tool: toolName,
+        file: filePath,
+        repeats: state.count,
+        unique_contents: state.fingerprints.size,
+        window_ms: SUCCESSFUL_EDIT_LOOP_WINDOW_MS,
+      }),
+      timestamp: Date.now(),
+    })
+    log.warn(`Successful edit loop blocked: ${toolName} → ${filePath}, repeats=${state.count}`)
+  }
+
+  function assertEditLoopAllowed(
+    sessionId: string,
+    toolName: string,
+    filePath: string,
+  ): void {
+    if (!isMutatingFileTool(toolName)) return
+    const state = getRecentSuccessfulEditState(sessionId, filePath)
+    if (!state || state.count < SUCCESSFUL_EDIT_LOOP_BLOCK_COUNT) return
+    rejectSuccessfulEditLoop(sessionId, filePath, toolName, state)
+    throw new SuccessfulEditLoopGuardError(filePath, state.count)
   }
 
   async function handleFileEdited(properties: Record<string, unknown>): Promise<void> {
@@ -1525,6 +1670,7 @@ export function createObserver(
       if (toolName === "edit" || toolName === "write") {
         log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId}, callId: ${callId}) — Phase 4: proactive risk check goes here`)
         const target = String(output.args?.filePath || output.args?.file || output.args?.path || "")
+        if (target) assertEditLoopAllowed(sessionId, toolName, target)
         const session = storage.getSession(sessionId)
         if (target && session) {
           try {
@@ -1553,6 +1699,7 @@ export function createObserver(
         log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId})`)
       }
     } catch (err) {
+      if (err instanceof SuccessfulEditLoopGuardError) throw err
       log.error("Ошибка в toolExecuteBefore", err)
     }
   }
@@ -1637,6 +1784,9 @@ export function createObserver(
       // Verification commands become Evidence Ledger records automatically.
       captureCommandEvidence(toolName, sessionId, args, resultTitle, resultOutput, status)
       inspectToolLoop(toolName, sessionId, safeArgsPreview, status)
+      if (status === "success" && targetFile && isMutatingFileTool(toolName)) {
+        recordSuccessfulEdit(toolName, sessionId, targetFile, args)
+      }
 
       const durationStr = duration !== null ? `${duration}мс` : "N/A"
       log.debug(`tool.execute.after: ${toolName} — ${status} (${durationStr})`)

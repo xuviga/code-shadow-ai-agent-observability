@@ -4,7 +4,7 @@
 
 *Плагин для OpenCode, который видит закономерности там, где человек видит хаос.*
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/xuviga/code-shadow-ai-agent-observability)
+[![Version](https://img.shields.io/badge/version-0.5.1-blue)](https://github.com/xuviga/code-shadow-ai-agent-observability)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![OpenCode](https://img.shields.io/badge/OpenCode-%3E%3D1.0-6C47FF)](https://opencode.ai)
 [![CI](https://github.com/xuviga/code-shadow-ai-agent-observability/actions/workflows/ci.yml/badge.svg)](https://github.com/xuviga/code-shadow-ai-agent-observability/actions/workflows/ci.yml)
@@ -888,7 +888,7 @@ Observer: session.compacted
 
 ## Статус проекта
 
-Текущий исходный релиз — `v0.5.0`. Основные сценарии Storage/Observer и agent-native loop покрыты
+Текущий исходный релиз — `v0.5.1`. Основные сценарии Storage/Observer и agent-native loop покрыты
 автоматическими тестами, а TypeScript проходит строгую проверку. Подробный
 фактический статус, состав схемы и границы интеграционной проверки описаны в
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
@@ -1001,7 +1001,7 @@ Observer: session.compacted
 2026 Q3: Фаза 8 (Autonomy)              ████████████████████ ✅
 ```
 
-> **v0.5.0 — predictive guarded agent loop.** Storage/Observer, Auto-Task, Auto-Plan, Counterfactual Planner, Auto-Evidence, Definition of Done, Permission Gate и Task/Evidence/Failure/Contract storage покрыты тестами, TypeScript
+> **v0.5.1 — predictive guarded agent loop.** Storage/Observer, Auto-Task, Auto-Plan, Counterfactual Planner, Auto-Evidence, Definition of Done, Permission Gate и successful edit-loop guard покрыты тестами, TypeScript
 > проходит typecheck. Перед публикацией нужен smoke-тест на конкретной версии
 > OpenCode и TUI-хоста.
 

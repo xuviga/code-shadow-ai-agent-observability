@@ -2,6 +2,16 @@
 
 All notable changes to Code Shadow are documented here.
 
+## [0.5.1] - 2026-09-29
+
+### Fixed
+
+- Detects successful `write`/`edit` loops that repeatedly rewrite one file in
+  the same session.
+- Emits a warning after three writes within the guard window.
+- Blocks the next write through the permission hook or the pre-execution hook.
+- Adds regression coverage for the `collector_async.py` failure pattern.
+
 ## [0.5.0] - 2026-09-29
 
 ### Added
