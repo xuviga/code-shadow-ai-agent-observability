@@ -258,7 +258,7 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
   // =========================================================================
 
   const config = loadConfig(pluginDir)
-  log.info(`Code Shadow v0.5.1 — Теневой наблюдатель активирован`)
+  log.info(`Code Shadow v0.5.2 — Теневой наблюдатель активирован`)
   log.info(`База данных: ${config.dbPath}`)
   log.info(`Хранение сырых данных: ${config.retentionDays} дней`)
 

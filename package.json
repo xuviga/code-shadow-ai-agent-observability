@@ -1,6 +1,6 @@
 {
   "name": "opencode-code-shadow",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Persistent memory, risk intelligence, and task guardrails for OpenCode AI agents",
   "main": "src/index.ts",
   "type": "module",

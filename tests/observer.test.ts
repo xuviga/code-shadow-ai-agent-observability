@@ -207,7 +207,7 @@ describe("Observer", () => {
       },
     })
 
-    for (const content of ["version one", "version two", "version three"]) {
+    for (const content of ["same version", "same version", "same version"]) {
       await observer["tool.execute.after"]({
         tool: "write", sessionID: sessionId, callID: `write-${content}`, args: { filePath: "src/collector_async.py", content },
       }, { title: "write file", output: "updated", metadata: {} })
@@ -236,6 +236,45 @@ describe("Observer", () => {
       expect(String(error)).toContain("остановлена повторная запись")
     }
     expect(blocked).toBe(true)
+  })
+
+  test("allows iterative edits after verified progress", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-write-progress"
+    await observer.event({
+      event: {
+        type: "session.created",
+        properties: { info: { id: sessionId, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+      },
+    })
+
+    for (const content of ["attempt one", "attempt two", "attempt three"]) {
+      await observer["tool.execute.after"]({
+        tool: "write", sessionID: sessionId, callID: `initial-${content}`, args: { filePath: "src/collector_async.py", content },
+      }, { title: "write file", output: "updated", metadata: {} })
+    }
+
+    await observer["tool.execute.after"]({
+      tool: "bash", sessionID: sessionId, callID: "verified-progress", args: { command: "npm test" },
+    }, { title: "npm test", output: "passed", metadata: {} })
+
+    for (const content of ["follow-up one", "follow-up two", "follow-up three"]) {
+      await observer["tool.execute.after"]({
+        tool: "write", sessionID: sessionId, callID: `follow-up-${content}`, args: { filePath: "src/collector_async.py", content },
+      }, { title: "write file", output: "updated", metadata: {} })
+    }
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "write", sessionID: sessionId, callID: "progress-allowed" },
+        { args: { filePath: "src/collector_async.py", content: "follow-up four" } },
+      )
+    } catch {
+      blocked = true
+    }
+    expect(blocked).toBe(false)
+    storage.flushBatch()
   })
 
   test("emits a preflight warning for an edit outside the active contract", async () => {
