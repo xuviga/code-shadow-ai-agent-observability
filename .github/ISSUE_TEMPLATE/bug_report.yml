@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible problem in Code Shadow
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove proprietary source code, database files, and credentials before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Code Shadow version
+      placeholder: 0.5.0
+    validations:
+      required: true
+  - type: input
+    id: opencode
+    attributes:
+      label: OpenCode version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include the hook, tool, command, or TUI action that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+    validations:
+      required: true
