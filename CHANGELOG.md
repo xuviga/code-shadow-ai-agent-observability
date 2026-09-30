@@ -2,6 +2,18 @@
 
 All notable changes to Code Shadow are documented here.
 
+## [0.5.3] - 2026-09-30
+
+### Fixed
+
+- Keeps targeted `edit` operations available after an agent moves from full
+  rewrites to incremental fixes in the same file.
+- Applies the no-progress streak threshold only to consecutive full `write`
+  operations; repeated identical content remains blocked for both `write` and
+  `edit`.
+- Adds regression coverage for the `metadeobf.py` parser-fix workflow and for
+  file paths containing `test`.
+
 ## [0.5.2] - 2026-09-29
 
 ### Improved
@@ -11,7 +23,7 @@ All notable changes to Code Shadow are documented here.
 - Different edits remain allowed; verified test/typecheck/build progress resets
   the suspicion state, as does a new user request.
 - Repeated identical content is treated as a strong loop signal.
-- A long sequence of five writes without verified progress is escalated.
+- A long sequence of five consecutive full writes without verified progress is escalated.
 - Prevents file paths containing words such as `test` from being misclassified
   as verification commands that reset the guard.
 - Adds real OpenCode smoke coverage for both blocking and legitimate progress.
@@ -22,7 +34,7 @@ All notable changes to Code Shadow are documented here.
 
 - Detects successful `write`/`edit` loops that repeatedly rewrite one file in
   the same session.
-- Emits a warning after three writes within the guard window.
+- Emits a warning after three successful file mutations within the guard window.
 - Allows different iterative edits and resets suspicion after verified progress.
 - Blocks repeated identical content or a long no-progress rewrite sequence
   through the permission hook or the pre-execution hook.

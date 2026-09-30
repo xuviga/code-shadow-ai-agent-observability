@@ -209,18 +209,18 @@ describe("Observer", () => {
 
     for (const content of ["same version", "same version", "same version"]) {
       await observer["tool.execute.after"]({
-        tool: "write", sessionID: sessionId, callID: `write-${content}`, args: { filePath: "src/collector_async.py", content },
+        tool: "write", sessionID: sessionId, callID: `write-${content}`, args: { filePath: "C:/test/collector_async.py", content },
       }, { title: "write file", output: "updated", metadata: {} })
     }
     storage.flushBatch()
 
     const warning = storage.getDevEvents("tool_rejected").find((event) => String(event.metadata?.reason) === "successful_edit_loop_warning")
-    expect(warning?.filePath).toBe("src/collector_async.py")
+    expect(warning?.filePath).toBe("C:/test/collector_async.py")
     expect(warning?.metadata?.repeats).toBe(3)
 
     const permission = { status: "ask" as const }
     await observer["permission.ask"]({
-      id: "permission-write-loop", type: "write", pattern: "src/collector_async.py",
+      id: "permission-write-loop", type: "write", pattern: "C:/test/collector_async.py",
       sessionID: sessionId, messageID: "message-loop", title: "Rewrite file", metadata: {},
     }, permission)
     expect(permission.status).toBe("deny")
@@ -229,7 +229,7 @@ describe("Observer", () => {
     try {
       await observer["tool.execute.before"](
         { tool: "write", sessionID: sessionId, callID: "write-blocked" },
-        { args: { filePath: "src/collector_async.py", content: "version four" } },
+        { args: { filePath: "C:/test/collector_async.py", content: "version four" } },
       )
     } catch (error) {
       blocked = true
@@ -274,6 +274,79 @@ describe("Observer", () => {
       blocked = true
     }
     expect(blocked).toBe(false)
+    storage.flushBatch()
+  })
+
+  test("allows targeted edits after full rewrites without verified progress", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-targeted-edits"
+    await observer.event({
+      event: {
+        type: "session.created",
+        properties: { info: { id: sessionId, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+      },
+    })
+
+    for (const content of ["full rewrite one", "full rewrite two", "full rewrite three"]) {
+      await observer["tool.execute.after"]({
+        tool: "write", sessionID: sessionId, callID: `full-${content}`, args: { filePath: "src/metadeobf.py", content },
+      }, { title: "write file", output: "updated", metadata: {} })
+    }
+
+    for (const newString of ["patch one", "patch two", "patch three", "patch four", "patch five"]) {
+      await observer["tool.execute.after"]({
+        tool: "edit", sessionID: sessionId, callID: `patch-${newString}`,
+        args: { filePath: "src/metadeobf.py", oldString: "previous value", newString },
+      }, { title: "edit file", output: "updated", metadata: {} })
+    }
+
+    const permission = { status: "ask" as const }
+    await observer["permission.ask"]({
+      id: "permission-targeted-edit", type: "edit", pattern: "src/metadeobf.py",
+      sessionID: sessionId, messageID: "message-targeted-edit", title: "Patch parser", metadata: {},
+    }, permission)
+    expect(permission.status).toBe("ask")
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "edit", sessionID: sessionId, callID: "targeted-edit-allowed" },
+        { args: { filePath: "src/metadeobf.py", oldString: "patch five", newString: "patch six" } },
+      )
+    } catch {
+      blocked = true
+    }
+    expect(blocked).toBe(false)
+    storage.flushBatch()
+  })
+
+  test("blocks the next full rewrite after five consecutive writes without progress", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-full-write-streak"
+    await observer.event({
+      event: {
+        type: "session.created",
+        properties: { info: { id: sessionId, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+      },
+    })
+
+    for (let index = 1; index <= 5; index += 1) {
+      await observer["tool.execute.after"]({
+        tool: "write", sessionID: sessionId, callID: `streak-${index}`,
+        args: { filePath: "src/collector_async.py", content: `rewrite ${index}` },
+      }, { title: "write file", output: "updated", metadata: {} })
+    }
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "write", sessionID: sessionId, callID: "streak-blocked" },
+        { args: { filePath: "src/collector_async.py", content: "rewrite 6" } },
+      )
+    } catch {
+      blocked = true
+    }
+    expect(blocked).toBe(true)
     storage.flushBatch()
   })
 

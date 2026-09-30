@@ -93,6 +93,9 @@ const toolLoopMap = new Map<string, { count: number; lastStatus: string }>()
  */
 type SuccessfulEditLoopState = {
   count: number
+  writeCount: number
+  editCount: number
+  writeStreak: number
   firstAt: number
   lastAt: number
   fingerprints: Map<string, number>
@@ -772,7 +775,7 @@ export function createObserver(
 
       for (const target of targets) {
         const loopState = getRecentSuccessfulEditState(input.sessionID, target)
-        if (loopState && shouldBlockSuccessfulEditLoop(loopState)) {
+        if (loopState && shouldBlockSuccessfulEditLoop(loopState, input.type)) {
           rejectSuccessfulEditLoop(input.sessionID, target, input.type, loopState)
           output.status = "deny"
           return
@@ -907,12 +910,19 @@ export function createObserver(
     const key = successfulEditLoopKey(sessionId, filePath)
     let state = getRecentSuccessfulEditState(sessionId, filePath, now)
     if (!state) {
-      state = { count: 0, firstAt: now, lastAt: now, fingerprints: new Map<string, number>(), warned: false, blocked: false }
+      state = { count: 0, writeCount: 0, editCount: 0, writeStreak: 0, firstAt: now, lastAt: now, fingerprints: new Map<string, number>(), warned: false, blocked: false }
       successfulEditLoopMap.set(key, state)
     }
 
     state.count += 1
     state.lastAt = now
+    if (toolName.toLowerCase() === "write") {
+      state.writeCount += 1
+      state.writeStreak += 1
+    } else {
+      state.editCount += 1
+      state.writeStreak = 0
+    }
     const fingerprint = getEditFingerprint(toolName, args)
     if (fingerprint) state.fingerprints.set(fingerprint, (state.fingerprints.get(fingerprint) || 0) + 1)
 
@@ -927,6 +937,8 @@ export function createObserver(
           tool: toolName,
           file: filePath,
           repeats: state.count,
+          writes: state.writeCount,
+          edits: state.editCount,
           unique_contents: state.fingerprints.size,
           window_ms: SUCCESSFUL_EDIT_LOOP_WINDOW_MS,
         }),
@@ -955,6 +967,9 @@ export function createObserver(
         tool: toolName,
         file: filePath,
         repeats: state.count,
+        writes: state.writeCount,
+        edits: state.editCount,
+        write_streak: state.writeStreak,
         unique_contents: state.fingerprints.size,
         window_ms: SUCCESSFUL_EDIT_LOOP_WINDOW_MS,
       }),
@@ -963,10 +978,11 @@ export function createObserver(
     log.warn(`Successful edit loop blocked: ${toolName} → ${filePath}, repeats=${state.count}`)
   }
 
-  function shouldBlockSuccessfulEditLoop(state: SuccessfulEditLoopState): boolean {
+  function shouldBlockSuccessfulEditLoop(state: SuccessfulEditLoopState, toolName: string): boolean {
     const repeatedContent = Array.from(state.fingerprints.values()).some((count) => count >= 2)
-    const sameFileWithoutVerification = state.count >= SUCCESSFUL_EDIT_LOOP_NO_PROGRESS_BLOCK_COUNT
-    return state.count >= SUCCESSFUL_EDIT_LOOP_REPEAT_BLOCK_COUNT && (repeatedContent || sameFileWithoutVerification)
+    const fullRewriteWithoutProgress = toolName.toLowerCase() === "write"
+      && state.writeStreak >= SUCCESSFUL_EDIT_LOOP_NO_PROGRESS_BLOCK_COUNT
+    return state.count >= SUCCESSFUL_EDIT_LOOP_REPEAT_BLOCK_COUNT && (repeatedContent || fullRewriteWithoutProgress)
   }
 
   function assertEditLoopAllowed(
@@ -977,7 +993,7 @@ export function createObserver(
     if (!isMutatingFileTool(toolName)) return
     const state = getRecentSuccessfulEditState(sessionId, filePath)
     if (!state) return
-    if (!shouldBlockSuccessfulEditLoop(state)) return
+    if (!shouldBlockSuccessfulEditLoop(state, toolName)) return
     rejectSuccessfulEditLoop(sessionId, filePath, toolName, state)
     throw new SuccessfulEditLoopGuardError(filePath, state.count)
   }
