@@ -59,6 +59,13 @@ export function createDecideTool(
 ): Record<string, unknown> {
   const decideLog = createLogger("decide-tool")
 
+  const resolveProjectRoot = (context: Record<string, unknown>, explicit?: string): string => {
+    if (explicit) return explicit
+    const sid = context.sessionID as string | undefined
+    const session = sid ? storage.getSession(sid) : undefined
+    return session?.projectRoot || (context.directory as string | undefined) || (context.cwd as string | undefined) || process.cwd()
+  }
+
   return {
     code_shadow_decide: tool({
       description:
@@ -74,10 +81,12 @@ export function createDecideTool(
           .optional(),
         related_files: tool.schema.array(tool.schema.string()).optional(),
         tags: tool.schema.array(tool.schema.string()).optional(),
+        project_root: tool.schema.string().optional(),
       },
 
       async execute(args, context) {
         try {
+          const projectRoot = resolveProjectRoot(context as Record<string, unknown>, args.project_root)
           // 1. Санитизация текстовых полей
           const title = sanitizeContent(
             args.title as string,
@@ -90,10 +99,11 @@ export function createDecideTool(
           const decisionContext = args.context
             ? sanitizeContent(args.context as string, config.secretPatterns)
             : null
-          const alternatives = (args.alternatives as string[] | undefined) || null
+          const alternatives = ((args.alternatives as string[] | undefined) || null)
+            ?.map((value) => sanitizeContent(value, config.secretPatterns)) || null
           const status = (args.status as string | undefined) || "proposed"
-          const relatedFiles =
-            (args.related_files as string[] | undefined) || null
+          const relatedFiles = ((args.related_files as string[] | undefined) || null)
+            ?.map((value) => sanitizeContent(value, config.secretPatterns)) || null
 
           // Авто-извлечение тегов если не указаны явно
           let tags: string[]
@@ -117,6 +127,7 @@ export function createDecideTool(
             supersededBy: null,
             relatedFiles,
             tags,
+            projectRoot,
           })
 
           if (decisionId < 0) {
@@ -148,6 +159,7 @@ export function createDecideTool(
             },
             createdAt: Date.now(),
             updatedAt: Date.now(),
+            projectRoot,
           })
 
           // 3. Создаём узел в графе знаний для каждого related_file
@@ -157,11 +169,12 @@ export function createDecideTool(
               // Создаём или обновляем файловый узел
               const fileNodeId = storage.upsertNode({
                 nodeType: NodeType.File,
-                name: filePath.split("/").pop() || filePath,
+                name: filePath.split(/[\\/]/).pop() || filePath,
                 path: filePath,
                 metadata: null,
                 createdAt: Date.now(),
                 updatedAt: Date.now(),
+                projectRoot,
               })
 
               if (decisionNodeId > 0 && fileNodeId > 0) {

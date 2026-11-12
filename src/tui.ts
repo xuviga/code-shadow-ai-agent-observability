@@ -1,7 +1,8 @@
 // =============================================================================
 // Code Shadow — TUI Integration & Proactive Alerts (Фаза 4)
 // Интеграция с TUI-интерфейсом OpenCode: тосты предупреждений,
-// команды /shadow, инъекция контекста при компактизации сессии.
+// команды /shadow (событие tui.prompt.append), инъекция контекста при
+// компактизации сессии.
 // =============================================================================
 
 import type { ShadowConfig } from "./types"
@@ -9,12 +10,21 @@ import { StorageEngine } from "./storage"
 import type { createLogger } from "./logger"
 
 // ---------------------------------------------------------------------------
-// Интерфейс возвращаемых хуков
+// Интерфейс возвращаемых хуков (контракт @opencode-ai/plugin 1.18.x)
 // ---------------------------------------------------------------------------
+
+type ToastVariant = "info" | "success" | "warning" | "error"
+
+interface ToastClient {
+  tui?: {
+    showToast?: (options: any) => any
+    toast?: { show?: (payload: any) => any }
+  }
+}
 
 interface TuiHooks {
   "tool.execute.before": (input: any, output: any) => Promise<void>
-  "tui.prompt.append": (input: any, output: any) => Promise<void>
+  event: (input: { event: any }) => Promise<void>
   "experimental.session.compacting": (input: any, output: any) => Promise<void>
 }
 
@@ -26,7 +36,47 @@ export function createTuiIntegration(
   storage: StorageEngine,
   config: ShadowConfig,
   log: ReturnType<typeof createLogger>,
+  client?: ToastClient,
 ): TuiHooks {
+
+  function showToast(payload: {
+    title?: string
+    message: string
+    variant: ToastVariant
+    duration?: number
+  }): void {
+    try {
+      if (typeof client?.tui?.showToast === "function") {
+        void client.tui.showToast({ body: payload })
+        return
+      }
+      if (typeof client?.tui?.toast?.show === "function") {
+        void client.tui.toast.show(payload)
+        return
+      }
+      log.debug(`Toast (нет TUI-клиента): ${payload.message}`)
+    } catch (err) {
+      log.debug(`Не удалось показать toast: ${String(err)}`)
+    }
+  }
+
+  function projectRootForSession(sessionID?: string): string {
+    if (!sessionID) return ""
+    return storage.getSession(sessionID)?.projectRoot || ""
+  }
+
+  /**
+   * tui.prompt.append не содержит sessionID, поэтому для /shadow берём
+   * проект последней сессии. Это лучше, чем смешивать все проекты сразу.
+   */
+  function projectRootForPrompt(): string {
+    const rows = storage.queryRows<{ project_root: string }>(
+      `SELECT project_root FROM sessions
+       WHERE project_root IS NOT NULL AND project_root != ''
+       ORDER BY started_at DESC LIMIT 1`,
+    )
+    return rows[0]?.project_root || ""
+  }
 
   // =========================================================================
   // 1. Toast Warnings — предупреждения перед рискованными правками
@@ -43,9 +93,10 @@ export function createTuiIntegration(
         input.args?.file_path
       if (!filePath) return
 
-      const deps = storage.getDependencyCount(filePath)
-      const breakageRate = storage.getHistoricalBreakageRate(filePath, "90d")
-      const recentSessions = storage.getRecentSimilarChanges(filePath, "30d", 3)
+      const projectRoot = projectRootForSession(input.sessionID)
+      const deps = storage.getDependencyCount(filePath, projectRoot)
+      const breakageRate = storage.getHistoricalBreakageRate(filePath, "90d", projectRoot)
+      const recentSessions = storage.getRecentSimilarChanges(filePath, "30d", 3, projectRoot)
       const riskScore = Math.min(
         breakageRate * 0.6 + Math.min(deps / 20, 1) * 0.4,
         1,
@@ -60,17 +111,18 @@ export function createTuiIntegration(
         (s) => s.errorsCount > 0,
       )
 
-      const fileName = filePath.split("/").pop() || filePath
-      const type = riskScore >= config.riskErrorThreshold ? "error" : "warning"
+      const fileName = filePath.split(/[\\/]/).pop() || filePath
+      const variant: ToastVariant = riskScore >= config.riskErrorThreshold ? "error" : "warning"
       const briefReason = hasRecentBreakage
         ? `последнее изменение вызвало ошибку`
         : `${deps} зависимостей`
 
-      output.toast = {
-        type,
+      showToast({
+        title: "Code Shadow",
+        variant,
         message: `⚠️ ${fileName}: ${riskLevel} риск (${Math.round(riskScore * 100)}%) — ${briefReason}`,
         duration: 5000,
-      }
+      })
 
       log.info(
         `Toast: ${riskLevel} риск для ${filePath} (score: ${riskScore.toFixed(2)})`,
@@ -81,14 +133,19 @@ export function createTuiIntegration(
   }
 
   // =========================================================================
-  // 2. /shadow Commands — обработка кастомных команд
+  // 2. /shadow Commands — событие tui.prompt.append
   // =========================================================================
 
-  async function tuiPromptAppend(input: any, output: any): Promise<void> {
+  async function handleEvent(input: { event: any }): Promise<void> {
+    const event = input?.event
+    if (!event || event.type !== "tui.prompt.append") return
+
     try {
-      const text: string = input.text || ""
+      const text: string = event.properties?.text || ""
       if (!text.startsWith("/shadow")) return
 
+      const projectRoot =
+        projectRootForSession(event.properties?.sessionID) || projectRootForPrompt()
       const parts = text.trim().split(/\s+/)
       const subcommand = parts[1]
       const arg = parts.slice(2).join(" ")
@@ -102,10 +159,12 @@ export function createTuiIntegration(
             `SELECT file_path, COUNT(*) AS edit_count
              FROM file_edits
              WHERE timestamp >= ?1
+               AND (?2 IS NULL OR project_root = ?2)
              GROUP BY file_path
              ORDER BY edit_count DESC
              LIMIT 5`,
             cutoff,
+            projectRoot || null,
           ).map((row) => row.file_path)
           if (top.length === 0) {
             message = "Пока недостаточно данных для hotspots"
@@ -116,23 +175,23 @@ export function createTuiIntegration(
         }
         case "predict": {
           if (!arg) { message = "Укажите файл: /shadow predict src/app.ts"; break }
-          const deps = storage.getDependencyCount(arg)
-          const breakageRate = storage.getHistoricalBreakageRate(arg, "90d")
+          const deps = storage.getDependencyCount(arg, projectRoot)
+          const breakageRate = storage.getHistoricalBreakageRate(arg, "90d", projectRoot)
           const risk = Math.round(Math.min(breakageRate * 0.6 + Math.min(deps / 20, 1) * 0.4, 1) * 100)
           const level = risk < 30 ? "низкий" : risk < 60 ? "средний" : risk < 80 ? "высокий" : "критический"
-          message = `🔮 ${arg.split("/").pop()}: ${level} риск (${risk}%)`
+          message = `🔮 ${arg.split(/[\\/]/).pop()}: ${level} риск (${risk}%)`
           break
         }
         case "stats": {
-          const sessions = storage.getSessionCount("30d")
-          const files = storage.getDistinctFiles("30d").length
+          const sessions = storage.getSessionCount("30d", projectRoot)
+          const files = storage.getDistinctFiles("30d", projectRoot).length
           message = `📊 За 30 дней: ${sessions} сессий, ${files} файлов`
           break
         }
         case "health": {
-          const files = storage.getDistinctFiles("30d")
-          const edits = files.reduce((sum, file) => sum + storage.getFileEditCount(file, "30d"), 0)
-          const errors = files.reduce((sum, file) => sum + storage.getErrorCountForFile(file, "30d"), 0)
+          const files = storage.getDistinctFiles("30d", projectRoot)
+          const edits = files.reduce((sum, file) => sum + storage.getFileEditCount(file, "30d", projectRoot), 0)
+          const errors = files.reduce((sum, file) => sum + storage.getErrorCountForFile(file, "30d", projectRoot), 0)
           const score = edits > 0 ? Math.max(0, Math.round((1 - errors / edits) * 100)) : 100
           message = `💚 Здоровье проекта: ${score}% (${files.length} файлов, ${errors} ошибок)`
           break
@@ -152,12 +211,12 @@ export function createTuiIntegration(
       }
 
       if (message) {
-        output.toast = {
-          variant: "info" as const,
+        showToast({
           title: "Code Shadow",
+          variant: "info",
           message,
           duration: 5000,
-        }
+        })
       }
     } catch (err) {
       log.error(`Ошибка /shadow: ${String(err)}`)
@@ -172,12 +231,13 @@ export function createTuiIntegration(
     output.context = output.context || []
 
     try {
-      // 1. Project identity
-      const projectRoot = input.projectRoot || ""
+      // 1. Project identity: контракт даёт только sessionID.
+      const session = input.sessionID ? storage.getSession(input.sessionID) : undefined
+      const projectRoot = session?.projectRoot || ""
       const projectName = projectRoot.split(/[\\/]/).pop() || "неизвестный проект"
 
-      // 2. Memory facts
-      const memoryNodes = storage.searchNodes("", 20) || []
+      // 2. Memory facts (project-scoped; пустой root не подмешивает чужие проекты)
+      const memoryNodes = storage.searchNodes("", 20, projectRoot) || []
       const facts = memoryNodes
         .filter((n: any) => n.nodeType !== "note")
         .map((n: any) => {
@@ -188,24 +248,30 @@ export function createTuiIntegration(
         })
 
       // 3. Hotspots
-      const files = storage.getDistinctFiles("30d")
+      const files = storage.getDistinctFiles("30d", projectRoot)
       const hotspots: { file: string; edits: number; errors: number }[] = []
       for (const f of files.slice(0, 10)) {
-        const edits = storage.getFileEditCount(f, "30d")
-        const errors = storage.getErrorCountForFile(f, "30d")
+        const edits = storage.getFileEditCount(f, "30d", projectRoot)
+        const errors = storage.getErrorCountForFile(f, "30d", projectRoot)
         if (edits >= 2) hotspots.push({ file: f, edits, errors })
       }
       hotspots.sort((a, b) => b.edits - a.edits)
 
       // 4. Stats
-      const sessionCount = storage.getSessionCount("30d")
+      const sessionCount = storage.getSessionCount("30d", projectRoot)
       const totalFiles = files.length
 
       // 5. Project health
-      const stats = storage.getStats()
-      const totalErrors = stats.tableCounts["session_errors"] || 0
-      const healthPct = sessionCount > 0
-        ? Math.round(Math.max(0, Math.min(100, 100 - (totalErrors / sessionCount) * 100)))
+      const totalErrors = files.reduce(
+        (sum, file) => sum + storage.getErrorCountForFile(file, "30d", projectRoot),
+        0,
+      )
+      const totalEdits = files.reduce(
+        (sum, file) => sum + storage.getFileEditCount(file, "30d", projectRoot),
+        0,
+      )
+      const healthPct = totalEdits > 0
+        ? Math.round(Math.max(0, Math.min(100, (1 - totalErrors / totalEdits) * 100)))
         : 100
 
       // BUILD THE BRIEFING
@@ -245,7 +311,7 @@ ${hotspots.slice(0, 8).map(h => `- ${h.file} (${h.edits} правок${h.errors 
 
   return {
     "tool.execute.before": toolExecuteBefore,
-    "tui.prompt.append": tuiPromptAppend,
+    event: handleEvent,
     "experimental.session.compacting": sessionCompacting,
   }
 }

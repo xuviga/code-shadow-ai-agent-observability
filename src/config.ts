@@ -13,7 +13,7 @@ import type { ShadowConfig } from "./types";
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_CONFIG: ShadowConfig = {
-  dbPath: path.join(os.homedir(), ".config", "opencode", "shadow", "data.db"),
+  dbPath: "~/.config/opencode/shadow/data.db",
   retentionDays: 90,
   sessionRetentionDays: 365,
   batchSize: 10,
@@ -63,7 +63,12 @@ export const DEFAULT_CONFIG: ShadowConfig = {
  */
 export function resolvePath(rawPath: string): string {
   if (rawPath.startsWith("~")) {
-    return path.join(os.homedir(), rawPath.slice(1));
+    // Environment first: os.homedir() can be cached by the runtime, which
+    // breaks isolated test homes and portable configs.
+    const envHome = process.platform === "win32"
+      ? process.env.USERPROFILE || process.env.HOME
+      : process.env.HOME || process.env.USERPROFILE;
+    return path.join(envHome || os.homedir(), rawPath.slice(1));
   }
   return rawPath;
 }

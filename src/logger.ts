@@ -6,13 +6,22 @@
 
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { homedir } from "node:os"
+import { resolvePath } from "./config"
 
-const LOG_DIR = path.join(homedir(), ".config", "opencode", "shadow")
-const LOG_FILE = path.join(LOG_DIR, "shadow.log")
+let logDir: string | null = null
 
-if (!fs.existsSync(LOG_DIR)) {
-  fs.mkdirSync(LOG_DIR, { recursive: true })
+function getLogFile(): string {
+  if (!logDir) {
+    // Resolve lazily: homedir may be overridden (tests, portable setups) and
+    // an unwritable config directory must not break plugin import.
+    logDir = resolvePath("~/.config/opencode/shadow")
+    try {
+      fs.mkdirSync(logDir, { recursive: true })
+    } catch {
+      // appendFileSync will fail silently below.
+    }
+  }
+  return path.join(logDir, "shadow.log")
 }
 
 function writeLog(level: string, namespace: string, message: string, ...args: unknown[]): void {
@@ -25,7 +34,7 @@ function writeLog(level: string, namespace: string, message: string, ...args: un
     }).join(" ") : ""
 
     const line = `${timestamp.substring(0, 23)} [CodeShadow][${namespace}] [${level}] ${message}${extra}\n`
-    fs.appendFileSync(LOG_FILE, line, "utf-8")
+    fs.appendFileSync(getLogFile(), line, "utf-8")
   } catch {
     // Silently fail — logging should never crash the plugin
   }

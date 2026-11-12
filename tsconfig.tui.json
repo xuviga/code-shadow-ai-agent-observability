@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": false,
+    "rootDir": ".",
+    "outDir": "./.tui-dist",
+    "jsx": "preserve",
+    "types": ["bun-types"]
+  },
+  "include": ["tui-plugin.tsx", "types/**/*.d.ts"],
+  "exclude": ["node_modules", "dist", ".tui-dist"]
+}

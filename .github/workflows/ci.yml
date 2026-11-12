@@ -27,6 +27,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Typecheck TUI panel
+        run: npm run typecheck:tui
+
       - name: Build
         run: npm run build
 

@@ -47,6 +47,12 @@ import { migrateV003LspErrorType } from "./migrations/003_lsp_error_type";
 import { migrateV004ExploreAgentType } from "./migrations/004_explore_agent_type";
 import { migrateV005AddTodos } from "./migrations/005_add_todos";
 import { migrateV006AgentNative } from "./migrations/006_agent_native";
+import { migrateV007RestoreErrorFileIndex } from "./migrations/007_restore_error_file_index";
+import { migrateV008ProjectScope } from "./migrations/008_project_scope";
+import { migrateV009AnalyticsIndexes } from "./migrations/009_analytics_indexes";
+import { migrateV010KnowledgeNodeNaturalKey } from "./migrations/010_knowledge_node_natural_key";
+import { migrateV011KnowledgeFts } from "./migrations/011_knowledge_fts";
+import { pathMatches } from "./path-match";
 
 // ---------------------------------------------------------------------------
 // Логгер
@@ -67,6 +73,23 @@ function hashString(str: string): string {
   }
   return (hash >>> 0).toString(16);
 }
+
+/** Обрезает пользовательский текст до безопасного размера. */
+function truncateText(value: string | null | undefined, max: number): string | null {
+  if (value === null || value === undefined) return null;
+  return value.length > max ? value.slice(0, max) : value;
+}
+
+/** Обрезает JSON так, чтобы он оставался валидным. */
+function truncateJson(value: unknown, max: number): string | null {
+  if (value === null || value === undefined) return null;
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= max) return serialized;
+  return JSON.stringify({ truncated: true, preview: serialized.slice(0, Math.max(0, max - 40)) });
+}
+
+/** Максимальный размер очереди пакетной записи. */
+const MAX_BATCH_QUEUE_SIZE = 10000;
 
 /**
  * Преобразует строковой timeframe ("7d", "30d", "90d", "all")
@@ -99,6 +122,16 @@ function daysInTimeframe(timeframe?: string, fallbackDays?: number): number {
 /**
  * Генерирует уникальный идентификатор сессии (UUID v4).
  */
+/** Строит безопасный FTS5-запрос из пользовательской строки. */
+function toFtsQuery(query: string): string | null {
+  const tokens = (query.match(/[\p{L}\p{N}_]+/gu) ?? [])
+    // Single Latin letters/numbers are too noisy (e.g. "C++", "v2"): they match
+    // JSON keys such as "content". Keep single non-ASCII tokens (CJK).
+    .filter((token) => token.length >= 2 || /[^\x00-\x7F]/.test(token));
+  if (tokens.length === 0) return null;
+  return tokens.map((token) => `"${token}"*`).join(" OR ");
+}
+
 function generateSessionId(): string {
   return crypto.randomUUID();
 }
@@ -175,6 +208,7 @@ interface DecisionRow {
   superseded_by: number | null;
   related_files: string | null;
   tags: string | null;
+  project_root: string | null;
 }
 
 interface KnowledgeNodeRow {
@@ -185,6 +219,7 @@ interface KnowledgeNodeRow {
   metadata: string | null;
   created_at: number;
   updated_at: number;
+  project_root: string | null;
 }
 
 interface KnowledgeEdgeRow {
@@ -296,6 +331,7 @@ function rowToDecision(row: DecisionRow): Decision {
     supersededBy: row.superseded_by,
     relatedFiles: row.related_files ? JSON.parse(row.related_files) : null,
     tags: row.tags ? JSON.parse(row.tags) : null,
+    projectRoot: row.project_root ?? null,
   };
 }
 
@@ -308,6 +344,7 @@ function rowToKnowledgeNode(row: KnowledgeNodeRow): KnowledgeNode {
     metadata: row.metadata ? JSON.parse(row.metadata) : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    projectRoot: row.project_root ?? null,
   };
 }
 
@@ -379,71 +416,72 @@ export class StorageEngine {
       this.runMigrations();
     } catch (err) {
       log.error(`Ошибка инициализации БД: ${String(err)}`);
+      try {
+        this.db?.close();
+      } catch {
+        // Ignore close failures while propagating the original error.
+      }
       this.db = null;
+      throw err;
     }
+  }
+
+  private readSchemaVersion(): number {
+    if (!this.db) return 0;
+    const tableCheck = this.db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'`,
+      )
+      .get() as { name: string } | undefined;
+    if (!tableCheck) return 0;
+    const row = this.db
+      .prepare(`SELECT MAX(version) as version FROM schema_version`)
+      .get() as { version: number | null } | undefined;
+    return row?.version ?? 0;
   }
 
   /** Проверяет текущую версию схемы и применяет непройденные миграции. */
   runMigrations(): void {
     if (!this.db) {
-      log.error("runMigrations: база данных не открыта");
-      return;
+      throw new Error("runMigrations: база данных не открыта");
+    }
+    const db = this.db;
+
+    const migrations: Array<{ version: number; description: string; run: (database: Database) => void }> = [
+      { version: 1, description: "001 (начальная схема)", run: migrateV001Initial },
+      { version: 2, description: "002 (исправление CHECK developer_events)", run: migrateV002FixEventTypes },
+      { version: 3, description: "003 (добавление lsp в session_errors)", run: migrateV003LspErrorType },
+      { version: 4, description: "004 (добавление 'explore' agent type)", run: migrateV004ExploreAgentType },
+      { version: 5, description: "005 (добавление таблицы todos)", run: migrateV005AddTodos },
+      { version: 6, description: "006 (agent-native память)", run: migrateV006AgentNative },
+      { version: 7, description: "007 (восстановление idx_errors_file)", run: migrateV007RestoreErrorFileIndex },
+      { version: 8, description: "008 (project scope для памяти и решений)", run: migrateV008ProjectScope },
+      { version: 9, description: "009 (аналитические индексы и unique edges)", run: migrateV009AnalyticsIndexes },
+      { version: 10, description: "010 (natural-key уникальность knowledge_nodes)", run: migrateV010KnowledgeNodeNaturalKey },
+      { version: 11, description: "011 (FTS5-индекс памяти)", run: migrateV011KnowledgeFts },
+    ];
+
+    log.debug(`Текущая версия схемы: ${this.readSchemaVersion()}`);
+
+    // Re-read the version before each step. A second process may have applied
+    // the same migration while this one was starting; a genuine failure is
+    // propagated so the plugin fails fast instead of running on a half schema.
+    for (const migration of migrations) {
+      if (this.readSchemaVersion() >= migration.version) continue
+      log.info(`Применяю миграцию ${migration.description}...`)
+      try {
+        migration.run(db)
+      } catch (err) {
+        if (this.readSchemaVersion() >= migration.version) {
+          log.warn(`Миграция ${migration.version} уже применена другим процессом.`)
+          continue
+        }
+        log.error(`Ошибка миграции ${migration.version}: ${String(err)}`)
+        throw err
+      }
     }
 
-    try {
-      // Проверяем существование таблицы schema_version
-      const tableCheck = this.db
-        .prepare(
-          `SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'`,
-        )
-        .get() as { name: string } | undefined;
-
-      let currentVersion = 0;
-
-      if (tableCheck) {
-        const row = this.db
-          .prepare(`SELECT MAX(version) as version FROM schema_version`)
-          .get() as { version: number | null } | undefined;
-        currentVersion = row?.version ?? 0;
-      }
-
-      log.debug(`Текущая версия схемы: ${currentVersion}`);
-
-      // Применяем миграции по порядку
-      if (currentVersion < 1) {
-        log.info("Применяю миграцию 001 (начальная схема)...");
-        migrateV001Initial(this.db);
-      }
-
-      if (currentVersion < 2) {
-        log.info("Применяю миграцию 002 (исправление CHECK developer_events)...");
-        migrateV002FixEventTypes(this.db);
-      }
-
-      if (currentVersion < 3) {
-        log.info("Применяю миграцию 003 (добавление lsp в session_errors)...");
-        migrateV003LspErrorType(this.db);
-      }
-
-      if (currentVersion < 4) {
-        log.info("Применяю миграцию 004 (добавление 'explore' agent type)...");
-        migrateV004ExploreAgentType(this.db);
-      }
-
-      if (currentVersion < 5) {
-        log.info("Применяю миграцию 005 (добавление таблицы todos)...");
-        migrateV005AddTodos(this.db);
-      }
-
-      if (currentVersion < 6) {
-        log.info("Применяю миграцию 006 (agent-native память)...");
-        migrateV006AgentNative(this.db);
-      }
-
-      log.info("Все миграции применены.");
-    } catch (err) {
-      log.error(`Ошибка миграции: ${String(err)}`);
-    }
+    log.info("Все миграции применены.");
   }
 
   /** Закрывает соединение с базой данных. */
@@ -511,22 +549,18 @@ export class StorageEngine {
     }
   }
 
-  /** Возвращает список правок файла с опциональным фильтром по времени. */
-  getFileEdits(filePath: string, timeframe?: string): FileEdit[] {
+  /** Возвращает список правок файла с опциональным фильтром по времени и проекту. */
+  getFileEdits(filePath: string, timeframe?: string, projectRoot?: string, limit = 5000): FileEdit[] {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT * FROM file_edits WHERE file_path = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      query += ` ORDER BY timestamp DESC`;
-      const rows = db.prepare(query).all(...params) as FileEditRow[];
+      const query = `SELECT * FROM file_edits
+        WHERE file_path = ?1
+          AND (?2 IS NULL OR timestamp >= ?2)
+          AND (?3 IS NULL OR project_root = ?3)
+        ORDER BY timestamp DESC LIMIT ?4`;
+      const rows = db.prepare(query).all(filePath, cutoff, projectRoot ?? null, limit) as FileEditRow[];
       return rows.map(rowToFileEdit);
     } catch (err) {
       log.error(`Ошибка getFileEdits: ${String(err)}`);
@@ -535,20 +569,17 @@ export class StorageEngine {
   }
 
   /** Возвращает количество правок файла. */
-  getFileEditCount(filePath: string, timeframe?: string): number {
+  getFileEditCount(filePath: string, timeframe?: string, projectRoot?: string): number {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT COUNT(*) as cnt FROM file_edits WHERE file_path = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      const row = db.prepare(query).get(...params) as { cnt: number };
+      const row = db.prepare(
+        `SELECT COUNT(*) as cnt FROM file_edits
+         WHERE file_path = ?1
+           AND (?2 IS NULL OR timestamp >= ?2)
+           AND (?3 IS NULL OR project_root = ?3)`,
+      ).get(filePath, cutoff, projectRoot ?? null) as { cnt: number };
       return row.cnt;
     } catch (err) {
       log.error(`Ошибка getFileEditCount: ${String(err)}`);
@@ -557,20 +588,17 @@ export class StorageEngine {
   }
 
   /** Возвращает количество откаченных правок файла (was_reverted = 1). */
-  getRevertedEditCount(filePath: string, timeframe?: string): number {
+  getRevertedEditCount(filePath: string, timeframe?: string, projectRoot?: string): number {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT COUNT(*) as cnt FROM file_edits WHERE file_path = ?1 AND was_reverted = 1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      const row = db.prepare(query).get(...params) as { cnt: number };
+      const row = db.prepare(
+        `SELECT COUNT(*) as cnt FROM file_edits
+         WHERE file_path = ?1 AND was_reverted = 1
+           AND (?2 IS NULL OR timestamp >= ?2)
+           AND (?3 IS NULL OR project_root = ?3)`,
+      ).get(filePath, cutoff, projectRoot ?? null) as { cnt: number };
       return row.cnt;
     } catch (err) {
       log.error(`Ошибка getRevertedEditCount: ${String(err)}`);
@@ -737,8 +765,8 @@ export class StorageEngine {
         .run(
           error.sessionId,
           error.errorType,
-          error.errorMessage,
-          error.errorStack ?? null,
+          truncateText(error.errorMessage, 4000) ?? "",
+          truncateText(error.errorStack, 16000),
           error.contextFile ?? null,
           error.contextTool ?? null,
           error.timestamp,
@@ -756,21 +784,18 @@ export class StorageEngine {
   }
 
   /** Возвращает ошибки, связанные с указанным файлом. */
-  getErrorsForFile(filePath: string, timeframe?: string): SessionError[] {
+  getErrorsForFile(filePath: string, timeframe?: string, projectRoot?: string): SessionError[] {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT * FROM session_errors WHERE context_file = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      query += ` ORDER BY timestamp DESC`;
-      const rows = db.prepare(query).all(...params) as SessionErrorRow[];
+      const query = `SELECT e.* FROM session_errors e
+        LEFT JOIN sessions s ON e.session_id = s.id
+        WHERE e.context_file = ?1
+          AND (?2 IS NULL OR e.timestamp >= ?2)
+          AND (?3 IS NULL OR s.project_root = ?3)
+        ORDER BY e.timestamp DESC`;
+      const rows = db.prepare(query).all(filePath, cutoff, projectRoot ?? null) as SessionErrorRow[];
       return rows.map(rowToSessionError);
     } catch (err) {
       log.error(`Ошибка getErrorsForFile: ${String(err)}`);
@@ -779,20 +804,18 @@ export class StorageEngine {
   }
 
   /** Возвращает количество ошибок, связанных с указанным файлом. */
-  getErrorCountForFile(filePath: string, timeframe?: string): number {
+  getErrorCountForFile(filePath: string, timeframe?: string, projectRoot?: string): number {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT COUNT(*) as cnt FROM session_errors WHERE context_file = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      const row = db.prepare(query).get(...params) as { cnt: number };
+      const row = db.prepare(
+        `SELECT COUNT(*) as cnt FROM session_errors e
+         LEFT JOIN sessions s ON e.session_id = s.id
+         WHERE e.context_file = ?1
+           AND (?2 IS NULL OR e.timestamp >= ?2)
+           AND (?3 IS NULL OR s.project_root = ?3)`,
+      ).get(filePath, cutoff, projectRoot ?? null) as { cnt: number };
       return row.cnt;
     } catch (err) {
       log.error(`Ошибка getErrorCountForFile: ${String(err)}`);
@@ -934,9 +957,10 @@ export class StorageEngine {
     const now = Date.now(), id = input.id || crypto.randomUUID()
     this.getDb().prepare(`INSERT INTO agent_tasks
       (id, project_root, session_id, title, goal, status, priority, created_at, updated_at, completed_at, metadata)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,NULL,?9)`).run(
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)`).run(
       id, input.projectRoot, input.sessionId ?? null, input.title, input.goal,
-      input.status, input.priority ?? 50, now, this.json(input.metadata),
+      input.status, input.priority ?? 50, now, input.status === "completed" ? now : null,
+      this.json(input.metadata),
     )
     return this.getTask(id)!
   }
@@ -957,10 +981,18 @@ export class StorageEngine {
   updateTask(id: string, patch: Partial<Pick<AgentTask, "title" | "goal" | "status" | "priority" | "metadata">>): AgentTask | undefined {
     const fields: string[] = [], values: unknown[] = []
     for (const [key, value] of Object.entries(patch)) {
+      // Partial patches from tools contain explicit undefined keys for every
+      // optional argument. Writing them would violate NOT NULL constraints.
+      if (value === undefined) continue
       const column = key === "metadata" ? "metadata" : key.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)
       fields.push(`${column} = ?`); values.push(key === "metadata" ? this.json(value) : value)
     }
-    if (patch.status === "completed") { fields.push("completed_at = ?"); values.push(Date.now()) }
+    if (patch.status === "completed") {
+      fields.push("completed_at = ?"); values.push(Date.now())
+    } else if (patch.status !== undefined) {
+      // Reopening a task must not keep a stale completion timestamp.
+      fields.push("completed_at = NULL")
+    }
     if (!fields.length) return this.getTask(id)
     fields.push("updated_at = ?"); values.push(Date.now(), id)
     this.getDb().prepare(`UPDATE agent_tasks SET ${fields.join(", ")} WHERE id = ?`).run(...(values as any[]))
@@ -976,20 +1008,22 @@ export class StorageEngine {
     const task = this.getTask(taskId)
     if (!task) return { ready: false, blockers: ["task_not_found"], checks: {} }
     const steps = this.listTaskSteps(taskId)
-    const evidence = this.listEvidence(task.projectRoot, taskId, 100)
-    const failures = this.searchFailures(task.projectRoot, task.goal, 100).filter((item) => item.taskId === taskId && item.status === "open")
+    // Use direct task_id lookups: a LIKE search on the goal can miss a failure
+    // whose text does not contain the exact goal wording, and LIMIT 100 can
+    // silently hide open blockers.
+    const verifiedEvidence = this.countVerifiedEvidenceForTask(task.projectRoot, taskId)
+    const openFailures = this.listOpenFailuresForTask(task.projectRoot, taskId).length
     const contracts = this.listChangeContracts(task.projectRoot, taskId)
-    const contradictions = this.listContradictions(task.projectRoot, "open", 100).filter((item) => item.taskId === taskId || !item.taskId)
+    const contradictions = this.countOpenContradictionsForTask(task.projectRoot, taskId)
     const pendingSteps = steps.filter((step) => !["completed", "skipped"].includes(step.status)).length
-    const verifiedEvidence = evidence.filter((item) => item.status === "verified").length
     const badContracts = contracts.filter((item) => ["active", "violated"].includes(item.status)).length
     const blockers: string[] = []
     if (steps.length === 0) blockers.push("no_steps")
     if (pendingSteps > 0) blockers.push(`pending_steps:${pendingSteps}`)
     if (verifiedEvidence === 0) blockers.push("no_verified_evidence")
-    if (failures.length > 0) blockers.push(`open_failures:${failures.length}`)
+    if (openFailures > 0) blockers.push(`open_failures:${openFailures}`)
     if (badContracts > 0) blockers.push(`unclosed_contracts:${badContracts}`)
-    if (contradictions.length > 0) blockers.push(`open_contradictions:${contradictions.length}`)
+    if (contradictions > 0) blockers.push(`open_contradictions:${contradictions}`)
     return {
       ready: blockers.length === 0,
       blockers,
@@ -997,9 +1031,9 @@ export class StorageEngine {
         steps: steps.length,
         pendingSteps,
         verifiedEvidence,
-        openFailures: failures.length,
+        openFailures,
         unclosedContracts: badContracts,
-        openContradictions: contradictions.length,
+        openContradictions: contradictions,
       },
     }
   }
@@ -1008,9 +1042,11 @@ export class StorageEngine {
     const now = Date.now(), id = input.id || crypto.randomUUID()
     this.getDb().prepare(`INSERT INTO task_steps
       (id, task_id, title, status, position, blocked_by, created_at, updated_at, completed_at, metadata)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?7,NULL,?8)`).run(
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9)`).run(
       id, input.taskId, input.title, input.status, input.position,
-      input.blockedBy ?? null, now, this.json(input.metadata),
+      input.blockedBy ?? null, now,
+      input.status === "completed" || input.status === "skipped" ? now : null,
+      this.json(input.metadata),
     )
     return this.getTaskStep(id)!
   }
@@ -1026,7 +1062,8 @@ export class StorageEngine {
 
   updateTaskStep(id: string, status: string, blockedBy?: string | null): TaskStep | undefined {
     const completed = status === "completed" ? Date.now() : null
-    this.getDb().prepare(`UPDATE task_steps SET status = ?1, blocked_by = ?2, completed_at = ?3, updated_at = ?4 WHERE id = ?5`).run(status, blockedBy ?? null, completed, Date.now(), id)
+    // Omitted blockedBy keeps the current value; an explicit value replaces it.
+    this.getDb().prepare(`UPDATE task_steps SET status = ?1, blocked_by = COALESCE(?2, blocked_by), completed_at = ?3, updated_at = ?4 WHERE id = ?5`).run(status, blockedBy ?? null, completed, Date.now(), id)
     return this.getTaskStep(id)
   }
 
@@ -1035,9 +1072,10 @@ export class StorageEngine {
     this.getDb().prepare(`INSERT INTO evidence_records
       (id, project_root, task_id, session_id, claim, evidence_type, source, status, confidence, details, created_at, verified_at)
       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`).run(
-      id, input.projectRoot, input.taskId ?? null, input.sessionId ?? null, input.claim,
-      input.evidenceType, input.source, input.status, Math.max(0, Math.min(1, input.confidence)),
-      input.details ?? null, now, input.status === "verified" ? now : null,
+      id, input.projectRoot, input.taskId ?? null, input.sessionId ?? null,
+      truncateText(input.claim, 2000) ?? "",
+      input.evidenceType, truncateText(input.source, 2000) ?? "", input.status, Math.max(0, Math.min(1, input.confidence)),
+      truncateText(input.details, 8000), now, input.status === "verified" ? now : null,
     )
     return this.getEvidence(id)!
   }
@@ -1054,6 +1092,14 @@ export class StorageEngine {
     return (rows as Record<string, any>[]).map((row) => this.evidenceRow(row))
   }
 
+  countVerifiedEvidenceForTask(projectRoot: string, taskId: string): number {
+    const row = this.getDb().prepare(
+      `SELECT COUNT(*) AS cnt FROM evidence_records
+       WHERE project_root = ?1 AND task_id = ?2 AND status = 'verified'`,
+    ).get(projectRoot, taskId) as { cnt: number }
+    return row.cnt
+  }
+
   updateEvidence(id: string, status: string, details?: string): EvidenceRecord | undefined {
     this.getDb().prepare(`UPDATE evidence_records SET status = ?1, details = COALESCE(?2, details), verified_at = CASE WHEN ?1 = 'verified' THEN ?3 ELSE verified_at END WHERE id = ?4`).run(status, details ?? null, Date.now(), id)
     return this.getEvidence(id)
@@ -1061,12 +1107,17 @@ export class StorageEngine {
 
   recordFailure(input: Omit<FailureMemory, "id" | "createdAt" | "resolvedAt" | "status"> & { id?: string; status?: FailureMemory["status"] }): FailureMemory {
     const now = Date.now(), id = input.id || crypto.randomUUID()
+    const status = input.status || "open"
     this.getDb().prepare(`INSERT INTO failure_memory
       (id, project_root, task_id, session_id, hypothesis, action, failure, root_cause, resolution, do_not_repeat, signature, status, created_at, resolved_at, metadata)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL,?14)`).run(
-      id, input.projectRoot, input.taskId ?? null, input.sessionId ?? null, input.hypothesis,
-      input.action, input.failure, input.rootCause ?? null, input.resolution ?? null,
-      input.doNotRepeat ?? null, input.signature ?? null, input.status || "open", now, this.json(input.metadata),
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)`).run(
+      id, input.projectRoot, input.taskId ?? null, input.sessionId ?? null,
+      truncateText(input.hypothesis, 4000) ?? "",
+      truncateText(input.action, 4000) ?? "", truncateText(input.failure, 4000) ?? "",
+      truncateText(input.rootCause, 4000), truncateText(input.resolution, 4000),
+      truncateText(input.doNotRepeat, 4000), truncateText(input.signature, 500),
+      status, now, status === "resolved" || status === "dismissed" ? now : null,
+      this.json(input.metadata),
     )
     return this.getFailure(id)!
   }
@@ -1081,6 +1132,15 @@ export class StorageEngine {
     const rows = this.getDb().prepare(`SELECT * FROM failure_memory
       WHERE project_root = ?1 AND (hypothesis LIKE ?2 OR action LIKE ?2 OR failure LIKE ?2 OR root_cause LIKE ?2 OR do_not_repeat LIKE ?2)
       ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, created_at DESC LIMIT ?3`).all(projectRoot, pattern, limit) as Record<string, any>[]
+    return rows.map((row) => this.failureRow(row))
+  }
+
+  listOpenFailuresForTask(projectRoot: string, taskId: string): FailureMemory[] {
+    const rows = this.getDb().prepare(
+      `SELECT * FROM failure_memory
+       WHERE project_root = ?1 AND task_id = ?2 AND status = 'open'
+       ORDER BY created_at DESC`,
+    ).all(projectRoot, taskId) as Record<string, any>[]
     return rows.map((row) => this.failureRow(row))
   }
 
@@ -1127,10 +1187,14 @@ export class StorageEngine {
   checkChangeContract(id: string, changedPaths: string[]): { contract: ChangeContract | undefined; allowed: boolean; violations: string[] } {
     const contract = this.getChangeContract(id)
     if (!contract) return { contract: undefined, allowed: false, violations: ["contract_not_found"] }
-    const matches = (pattern: string, value: string) => pattern === "*" || value === pattern || value.startsWith(pattern.replace(/[*]$/, ""))
+    // An empty check is not proof of compliance: keep the contract status
+    // unchanged instead of silently flipping it to "passed".
+    if (changedPaths.length === 0) {
+      return { contract, allowed: false, violations: [] }
+    }
     const violations = changedPaths.filter((file) => {
-      if (contract.forbiddenPaths.some((p) => matches(p, file))) return true
-      return contract.allowedPaths.length > 0 && !contract.allowedPaths.some((p) => matches(p, file))
+      if (contract.forbiddenPaths.some((pattern) => pathMatches(pattern, file, contract.projectRoot))) return true
+      return contract.allowedPaths.length > 0 && !contract.allowedPaths.some((pattern) => pathMatches(pattern, file, contract.projectRoot))
     })
     const updated = this.updateChangeContract(id, { status: violations.length ? "violated" : "passed", violations })
     return { contract: updated, allowed: violations.length === 0, violations }
@@ -1138,11 +1202,13 @@ export class StorageEngine {
 
   recordContradiction(input: Omit<ContradictionRecord, "id" | "createdAt" | "resolvedAt" | "status" | "resolution"> & { id?: string; status?: ContradictionRecord["status"]; resolution?: string | null }): ContradictionRecord {
     const now = Date.now(), id = input.id || crypto.randomUUID()
+    const status = input.status || "open"
+    const terminal = status === "resolved" || status === "accepted"
     this.getDb().prepare(`INSERT INTO contradiction_records
       (id, project_root, task_id, claim_a, source_a, claim_b, source_b, severity, status, resolution, created_at, resolved_at)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,NULL)`).run(
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`).run(
       id, input.projectRoot, input.taskId ?? null, input.claimA, input.sourceA, input.claimB,
-      input.sourceB, input.severity, input.status || "open", now,
+      input.sourceB, input.severity, status, input.resolution ?? null, now, terminal ? now : null,
     )
     return this.getContradiction(id)!
   }
@@ -1157,6 +1223,14 @@ export class StorageEngine {
     return rows.map((row) => this.contradictionRow(row))
   }
 
+  countOpenContradictionsForTask(projectRoot: string, taskId: string): number {
+    const row = this.getDb().prepare(
+      `SELECT COUNT(*) AS cnt FROM contradiction_records
+       WHERE project_root = ?1 AND status = 'open' AND (task_id = ?2 OR task_id IS NULL)`,
+    ).get(projectRoot, taskId) as { cnt: number }
+    return row.cnt
+  }
+
   resolveContradiction(id: string, resolution: string, status: "resolved" | "accepted" = "resolved"): ContradictionRecord | undefined {
     this.getDb().prepare(`UPDATE contradiction_records SET status = ?1, resolution = ?2, resolved_at = ?3 WHERE id = ?4`).run(status, resolution, Date.now(), id)
     return this.getContradiction(id)
@@ -1166,8 +1240,8 @@ export class StorageEngine {
     const result = this.getDb().prepare(`INSERT INTO provenance_events
       (project_root, session_id, source_type, source_ref, content_hash, trust_level, flags, snippet, created_at)
       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)`).run(
-      input.projectRoot, input.sessionId ?? null, input.sourceType, input.sourceRef,
-      input.contentHash, input.trustLevel, this.json(input.flags), input.snippet ?? null, Date.now(),
+      input.projectRoot, input.sessionId ?? null, input.sourceType, truncateText(input.sourceRef, 1000) ?? "",
+      input.contentHash, input.trustLevel, this.json(input.flags), truncateText(input.snippet, 2000), Date.now(),
     )
     return Number(result.lastInsertRowid)
   }
@@ -1184,29 +1258,35 @@ export class StorageEngine {
 
   createHandoff(input: Omit<AgentHandoff, "id" | "createdAt" | "completedAt" | "status"> & { id?: string; status?: AgentHandoff["status"] }): AgentHandoff {
     const now = Date.now(), id = input.id || crypto.randomUUID()
+    const status = input.status || "open"
     this.getDb().prepare(`INSERT INTO agent_handoffs
       (id, project_root, task_id, session_id, summary, next_action, payload, status, created_at, completed_at)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)`).run(
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`).run(
       id, input.projectRoot, input.taskId ?? null, input.sessionId ?? null,
-      input.summary, input.nextAction, this.json(input.payload), input.status || "open", now,
+      truncateText(input.summary, 4000) ?? "", truncateText(input.nextAction, 4000) ?? "",
+      truncateJson(input.payload, 32000), status, now, status === "completed" ? now : null,
     )
     return this.getHandoff(id)!
   }
 
-  getHandoff(id: string): AgentHandoff | undefined {
-    const row = this.getDb().prepare(`SELECT * FROM agent_handoffs WHERE id = ?1`).get(id) as Record<string, any> | undefined
-    return row ? {
+  private handoffRow(row: Record<string, any>): AgentHandoff {
+    return {
       id: row.id, projectRoot: row.project_root, taskId: row.task_id, sessionId: row.session_id,
       summary: row.summary, nextAction: row.next_action, payload: this.parseJson(row.payload, {}),
       status: row.status, createdAt: row.created_at, completedAt: row.completed_at,
-    } : undefined
+    }
+  }
+
+  getHandoff(id: string): AgentHandoff | undefined {
+    const row = this.getDb().prepare(`SELECT * FROM agent_handoffs WHERE id = ?1`).get(id) as Record<string, any> | undefined
+    return row ? this.handoffRow(row) : undefined
   }
 
   listHandoffs(projectRoot: string, status?: string, limit = 10): AgentHandoff[] {
     const rows = status
       ? this.getDb().prepare(`SELECT * FROM agent_handoffs WHERE project_root = ?1 AND status = ?2 ORDER BY created_at DESC LIMIT ?3`).all(projectRoot, status, limit)
       : this.getDb().prepare(`SELECT * FROM agent_handoffs WHERE project_root = ?1 ORDER BY created_at DESC LIMIT ?2`).all(projectRoot, limit)
-    return (rows as Record<string, any>[]).map((row) => this.getHandoff(row.id)!).filter(Boolean)
+    return (rows as Record<string, any>[]).map((row) => this.handoffRow(row))
   }
 
   updateHandoff(id: string, status: "open" | "claimed" | "completed"): AgentHandoff | undefined {
@@ -1254,21 +1334,21 @@ export class StorageEngine {
   getToolExecutionsForFile(
     filePath: string,
     timeframe?: string,
+    projectRoot?: string,
+    limit = 1000,
   ): ToolExecution[] {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT * FROM tool_executions WHERE target_file = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      query += ` ORDER BY timestamp DESC`;
-      const rows = db.prepare(query).all(...params) as ToolExecutionRow[];
+      const rows = db.prepare(
+        `SELECT te.* FROM tool_executions te
+         LEFT JOIN sessions s ON te.session_id = s.id
+         WHERE te.target_file = ?1
+           AND (?2 IS NULL OR te.timestamp >= ?2)
+           AND (?3 IS NULL OR s.project_root = ?3)
+         ORDER BY te.timestamp DESC LIMIT ?4`,
+      ).all(filePath, cutoff, projectRoot ?? null, limit) as ToolExecutionRow[];
       return rows.map(rowToToolExecution);
     } catch (err) {
       log.error(`Ошибка getToolExecutionsForFile: ${String(err)}`);
@@ -1288,20 +1368,21 @@ export class StorageEngine {
         .prepare(
           `INSERT INTO decisions
             (title, description, context, alternatives, status,
-             decided_by, decided_at, superseded_by, related_files, tags)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+             decided_by, decided_at, superseded_by, related_files, tags, project_root)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
         )
         .run(
           decision.title,
-          decision.description,
-          decision.context ?? null,
-          decision.alternatives ? JSON.stringify(decision.alternatives) : null,
+          truncateText(decision.description, 8000) ?? "",
+          truncateText(decision.context, 8000),
+          decision.alternatives ? JSON.stringify(decision.alternatives.slice(0, 50)) : null,
           decision.status,
           decision.decidedBy ?? null,
           decision.decidedAt,
           decision.supersededBy ?? null,
-          decision.relatedFiles ? JSON.stringify(decision.relatedFiles) : null,
-          decision.tags ? JSON.stringify(decision.tags) : null,
+          decision.relatedFiles ? JSON.stringify(decision.relatedFiles.slice(0, 200)) : null,
+          decision.tags ? JSON.stringify(decision.tags.slice(0, 100)) : null,
+          decision.projectRoot ?? null,
         );
 
       log.debug(
@@ -1314,22 +1395,27 @@ export class StorageEngine {
     }
   }
 
-  /** Возвращает список решений с фильтром по статусу. */
-  getDecisions(status?: string, limit = 50): Decision[] {
+  /** Возвращает список решений с фильтром по статусу и проекту. */
+  getDecisions(status?: string, limit = 50, projectRoot?: string): Decision[] {
     try {
       const db = this.getDb();
-
-      let query = `SELECT * FROM decisions`;
+      const conditions: string[] = [];
       const params: (string | number)[] = [];
 
       if (status) {
-        query += ` WHERE status = ?1`;
-        query += ` ORDER BY decided_at DESC LIMIT ?2`;
-        params.push(status, limit);
-      } else {
-        query += ` ORDER BY decided_at DESC LIMIT ?1`;
-        params.push(limit);
+        conditions.push(`status = ?${params.length + 1}`);
+        params.push(status);
       }
+      if (projectRoot) {
+        // Global legacy rows (NULL) stay visible in every project.
+        conditions.push(`(project_root IS NULL OR project_root = ?${params.length + 1})`);
+        params.push(projectRoot);
+      }
+
+      let query = `SELECT * FROM decisions`;
+      if (conditions.length > 0) query += ` WHERE ${conditions.join(" AND ")}`;
+      query += ` ORDER BY decided_at DESC LIMIT ?${params.length + 1}`;
+      params.push(limit);
 
       const rows = db.prepare(query).all(...params) as DecisionRow[];
       return rows.map(rowToDecision);
@@ -1362,16 +1448,17 @@ export class StorageEngine {
     try {
       const db = this.getDb();
       const now = Date.now();
+      const projectRoot = node.projectRoot ?? null;
 
       const metadata = node.metadata
         ? JSON.stringify(node.metadata)
         : null;
 
       if (node.nodeType === NodeType.File && node.path) {
-        // Для файловых узлов — ищем по path
-        const existing = db
-          .prepare(`SELECT id FROM knowledge_nodes WHERE node_type = 'file' AND path = ?1`)
-          .get(node.path) as { id: number } | undefined;
+        // Для файловых узлов — ищем по path внутри project scope.
+        const existing = projectRoot === null
+          ? db.prepare(`SELECT id FROM knowledge_nodes WHERE node_type = 'file' AND path = ?1 AND project_root IS NULL`).get(node.path) as { id: number } | undefined
+          : db.prepare(`SELECT id FROM knowledge_nodes WHERE node_type = 'file' AND path = ?1 AND project_root = ?2`).get(node.path, projectRoot) as { id: number } | undefined;
 
         if (existing) {
           db.prepare(
@@ -1382,10 +1469,10 @@ export class StorageEngine {
           return existing.id;
         }
       } else {
-        // Для остальных узлов — ищем по name и node_type
-        const existing = db
-          .prepare(`SELECT id FROM knowledge_nodes WHERE name = ?1 AND node_type = ?2`)
-          .get(node.name, node.nodeType) as { id: number } | undefined;
+        // Для остальных узлов — ищем по name, node_type и project scope.
+        const existing = projectRoot === null
+          ? db.prepare(`SELECT id FROM knowledge_nodes WHERE name = ?1 AND node_type = ?2 AND project_root IS NULL`).get(node.name, node.nodeType) as { id: number } | undefined
+          : db.prepare(`SELECT id FROM knowledge_nodes WHERE name = ?1 AND node_type = ?2 AND project_root = ?3`).get(node.name, node.nodeType, projectRoot) as { id: number } | undefined;
 
         if (existing) {
           db.prepare(
@@ -1401,8 +1488,8 @@ export class StorageEngine {
       const result = db
         .prepare(
           `INSERT INTO knowledge_nodes
-            (node_type, name, path, metadata, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+            (node_type, name, path, metadata, created_at, updated_at, project_root)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
         )
         .run(
           node.nodeType,
@@ -1411,6 +1498,7 @@ export class StorageEngine {
           metadata,
           node.createdAt || now,
           node.updatedAt || now,
+          projectRoot,
         );
 
       log.debug(`Узел знаний вставлен: id=${result.lastInsertRowid}, name=${node.name}`);
@@ -1435,18 +1523,51 @@ export class StorageEngine {
     }
   }
 
-  /** Поиск узлов по имени (LIKE). */
-  searchNodes(query: string, limit = 20): KnowledgeNode[] {
+  /**
+   * Поиск узлов памяти: FTS5 с bm25-ранжированием, при пустом результате —
+   * LIKE-fallback для подстрочных совпадений и legacy-совместимости.
+   */
+  searchNodes(query: string, limit = 20, projectRoot?: string): KnowledgeNode[] {
     try {
       const db = this.getDb();
+      const trimmed = query.trim();
+      const ftsQuery = trimmed ? toFtsQuery(trimmed) : null;
+
+      if (ftsQuery) {
+        try {
+          const rows = db.prepare(
+            `SELECT kn.* FROM knowledge_nodes_fts
+             JOIN knowledge_nodes kn ON kn.id = knowledge_nodes_fts.rowid
+             WHERE knowledge_nodes_fts MATCH ?1
+               AND (?2 IS NULL OR kn.project_root IS NULL OR kn.project_root = ?2)
+             ORDER BY
+               CASE
+                 WHEN kn.name = ?4 THEN 0
+                 WHEN kn.name LIKE ?5 THEN 1
+                 WHEN kn.path LIKE ?5 THEN 2
+                 ELSE 3
+               END,
+               bm25(knowledge_nodes_fts, 6.0, 2.0, 1.0),
+               kn.updated_at DESC
+             LIMIT ?3`,
+          ).all(ftsQuery, projectRoot ?? null, limit, trimmed, `%${trimmed}%`) as KnowledgeNodeRow[];
+          if (rows.length > 0) return rows.map(rowToKnowledgeNode);
+        } catch (ftsError) {
+          log.debug(`FTS-поиск недоступен, fallback LIKE: ${String(ftsError)}`);
+        }
+      }
+
+      const scope = projectRoot ? ` AND (project_root IS NULL OR project_root = ?3)` : "";
+      const params: (string | number)[] = [`%${query}%`, limit];
+      if (projectRoot) params.push(projectRoot);
       const rows = db
         .prepare(
           `SELECT * FROM knowledge_nodes
-           WHERE name LIKE ?1 OR path LIKE ?1 OR metadata LIKE ?1
+           WHERE (name LIKE ?1 OR path LIKE ?1 OR metadata LIKE ?1)${scope}
            ORDER BY updated_at DESC
            LIMIT ?2`,
         )
-        .all(`%${query}%`, limit) as KnowledgeNodeRow[];
+        .all(...params) as KnowledgeNodeRow[];
       return rows.map(rowToKnowledgeNode);
     } catch (err) {
       log.error(`Ошибка searchNodes: ${String(err)}`);
@@ -1454,13 +1575,16 @@ export class StorageEngine {
     }
   }
 
-  /** Возвращает все узлы заданного типа. */
-  getNodesByType(type: string): KnowledgeNode[] {
+  /** Возвращает все узлы заданного типа с опциональным project scope. */
+  getNodesByType(type: string, projectRoot?: string, limit = 1000): KnowledgeNode[] {
     try {
       const db = this.getDb();
-      const rows = db
-        .prepare(`SELECT * FROM knowledge_nodes WHERE node_type = ?1`)
-        .all(type) as KnowledgeNodeRow[];
+      const rows = db.prepare(
+        `SELECT * FROM knowledge_nodes
+         WHERE node_type = ?1
+           AND (?2 IS NULL OR project_root IS NULL OR project_root = ?2)
+         ORDER BY updated_at DESC LIMIT ?3`,
+      ).all(type, projectRoot ?? null, limit) as KnowledgeNodeRow[];
       return rows.map(rowToKnowledgeNode);
     } catch (err) {
       log.error(`Ошибка getNodesByType: ${String(err)}`);
@@ -1540,22 +1664,24 @@ export class StorageEngine {
     filePath: string,
     minFrequency = 1,
     projectRoot?: string,
+    limit = 20,
   ): { file: string; frequency: number }[] {
     try {
       const db = this.getDb();
       const rows = db
         .prepare(
-          `SELECT fe2.file_path AS file, COUNT(*) AS frequency
+          `SELECT fe2.file_path AS file, COUNT(DISTINCT fe1.session_id) AS frequency
            FROM file_edits fe1
            JOIN file_edits fe2 ON fe1.session_id = fe2.session_id
            WHERE fe1.file_path = ?1 AND fe2.file_path != ?2
              AND (?4 IS NULL OR fe1.project_root = ?4)
              AND (?4 IS NULL OR fe2.project_root = ?4)
            GROUP BY fe2.file_path
-           HAVING COUNT(*) >= ?3
-           ORDER BY frequency DESC`,
+           HAVING COUNT(DISTINCT fe1.session_id) >= ?3
+           ORDER BY frequency DESC
+           LIMIT ?5`,
         )
-        .all(filePath, filePath, minFrequency, projectRoot ?? null) as {
+        .all(filePath, filePath, minFrequency, projectRoot ?? null, limit) as {
         file: string;
         frequency: number;
       }[];
@@ -1563,6 +1689,212 @@ export class StorageEngine {
     } catch (err) {
       log.error(`Ошибка getCoChangedFiles: ${String(err)}`);
       return [];
+    }
+  }
+
+  // =========================================================================
+  // Агрегаты аналитики (без N+1 по файлам)
+  // =========================================================================
+
+  /** Суммарные правки, AI-правки и число файлов за период. */
+  getEditTotals(timeframe?: string, projectRoot?: string): { edits: number; aiEdits: number; files: number } {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const row = this.getDb().prepare(
+        `SELECT COUNT(*) AS edits,
+                COALESCE(SUM(CASE WHEN agent_type IN ('build','plan') THEN 1 ELSE 0 END), 0) AS ai_edits,
+                COUNT(DISTINCT file_path) AS files
+         FROM file_edits
+         WHERE (?1 IS NULL OR timestamp >= ?1)
+           AND (?2 IS NULL OR project_root = ?2)`,
+      ).get(cutoff, projectRoot ?? null) as { edits: number; ai_edits: number; files: number };
+      return { edits: row.edits ?? 0, aiEdits: row.ai_edits ?? 0, files: row.files ?? 0 };
+    } catch (err) {
+      log.error(`Ошибка getEditTotals: ${String(err)}`);
+      return { edits: 0, aiEdits: 0, files: 0 };
+    }
+  }
+
+  /** Суммарные правки за интервал [from, to). */
+  getEditTotalsBetween(from: number, to: number, projectRoot?: string): { edits: number; aiEdits: number; files: number } {
+    try {
+      const row = this.getDb().prepare(
+        `SELECT COUNT(*) AS edits,
+                COALESCE(SUM(CASE WHEN agent_type IN ('build','plan') THEN 1 ELSE 0 END), 0) AS ai_edits,
+                COUNT(DISTINCT file_path) AS files
+         FROM file_edits
+         WHERE timestamp >= ?1 AND timestamp < ?2
+           AND (?3 IS NULL OR project_root = ?3)`,
+      ).get(from, to, projectRoot ?? null) as { edits: number; ai_edits: number; files: number };
+      return { edits: row.edits ?? 0, aiEdits: row.ai_edits ?? 0, files: row.files ?? 0 };
+    } catch (err) {
+      log.error(`Ошибка getEditTotalsBetween: ${String(err)}`);
+      return { edits: 0, aiEdits: 0, files: 0 };
+    }
+  }
+
+  /** Ошибки на файлах, которые редактировались в периоде. */
+  getErrorTotalForEditedFiles(timeframe?: string, projectRoot?: string): number {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const row = this.getDb().prepare(
+        `SELECT COUNT(*) AS cnt FROM session_errors se
+         LEFT JOIN sessions s ON se.session_id = s.id
+         WHERE (?1 IS NULL OR se.timestamp >= ?1)
+           AND (?2 IS NULL OR s.project_root = ?2)
+           AND se.context_file IN (
+             SELECT file_path FROM file_edits fe
+             WHERE (?1 IS NULL OR fe.timestamp >= ?1)
+               AND (?2 IS NULL OR fe.project_root = ?2)
+           )`,
+      ).get(cutoff, projectRoot ?? null) as { cnt: number };
+      return row.cnt ?? 0;
+    } catch (err) {
+      log.error(`Ошибка getErrorTotalForEditedFiles: ${String(err)}`);
+      return 0;
+    }
+  }
+
+  /** Ошибки на редактировавшихся файлах за интервал [from, to). */
+  getErrorTotalForEditedFilesBetween(from: number, to: number, projectRoot?: string): number {
+    try {
+      const row = this.getDb().prepare(
+        `SELECT COUNT(*) AS cnt FROM session_errors se
+         LEFT JOIN sessions s ON se.session_id = s.id
+         WHERE se.timestamp >= ?1 AND se.timestamp < ?2
+           AND (?3 IS NULL OR s.project_root = ?3)
+           AND se.context_file IN (
+             SELECT file_path FROM file_edits fe
+             WHERE fe.timestamp >= ?1 AND fe.timestamp < ?2
+               AND (?3 IS NULL OR fe.project_root = ?3)
+           )`,
+      ).get(from, to, projectRoot ?? null) as { cnt: number };
+      return row.cnt ?? 0;
+    } catch (err) {
+      log.error(`Ошибка getErrorTotalForEditedFilesBetween: ${String(err)}`);
+      return 0;
+    }
+  }
+
+  /** Топ файлов по числу правок за период (полная выборка, не алфавитная). */
+  getTopFilesByEdits(timeframe?: string, limit = 10, projectRoot?: string): Array<{ filePath: string; edits: number }> {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const rows = this.getDb().prepare(
+        `SELECT file_path, COUNT(*) AS edits FROM file_edits
+         WHERE (?1 IS NULL OR timestamp >= ?1)
+           AND (?2 IS NULL OR project_root = ?2)
+         GROUP BY file_path ORDER BY edits DESC LIMIT ?3`,
+      ).all(cutoff, projectRoot ?? null, limit) as Array<{ file_path: string; edits: number }>;
+      return rows.map((row) => ({ filePath: row.file_path, edits: row.edits }));
+    } catch (err) {
+      log.error(`Ошибка getTopFilesByEdits: ${String(err)}`);
+      return [];
+    }
+  }
+
+  /** Распределение вызовов инструментов за период. */
+  getToolUsageCounts(timeframe?: string, projectRoot?: string): Record<string, number> {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const rows = this.getDb().prepare(
+        `SELECT te.tool_name, COUNT(*) AS calls FROM tool_executions te
+         LEFT JOIN sessions s ON te.session_id = s.id
+         WHERE (?1 IS NULL OR te.timestamp >= ?1)
+           AND (?2 IS NULL OR s.project_root = ?2)
+         GROUP BY te.tool_name ORDER BY calls DESC`,
+      ).all(cutoff, projectRoot ?? null) as Array<{ tool_name: string; calls: number }>;
+      const usage: Record<string, number> = {};
+      for (const row of rows) usage[row.tool_name] = row.calls;
+      return usage;
+    } catch (err) {
+      log.error(`Ошибка getToolUsageCounts: ${String(err)}`);
+      return {};
+    }
+  }
+
+  /** Правки и ошибки по каждому файлу за период (для module breakdown). */
+  getFileMetrics(timeframe?: string, projectRoot?: string): Array<{ filePath: string; edits: number; errors: number }> {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const rows = this.getDb().prepare(
+        `SELECT fe.file_path AS file_path, COUNT(*) AS edits,
+                (SELECT COUNT(*) FROM session_errors se
+                 LEFT JOIN sessions ss ON se.session_id = ss.id
+                 WHERE se.context_file = fe.file_path
+                   AND (?1 IS NULL OR se.timestamp >= ?1)
+                   AND (?2 IS NULL OR ss.project_root = ?2)) AS errors
+         FROM file_edits fe
+         WHERE (?1 IS NULL OR fe.timestamp >= ?1)
+           AND (?2 IS NULL OR fe.project_root = ?2)
+         GROUP BY fe.file_path`,
+      ).all(cutoff, projectRoot ?? null) as Array<{ file_path: string; edits: number; errors: number }>;
+      return rows.map((row) => ({ filePath: row.file_path, edits: row.edits, errors: row.errors }));
+    } catch (err) {
+      log.error(`Ошибка getFileMetrics: ${String(err)}`);
+      return [];
+    }
+  }
+
+  /** Одна агрегатная выборка для hotspots вместо 6 запросов на файл. */
+  getHotspotMetrics(timeframe?: string, projectRoot?: string): Array<{
+    filePath: string;
+    edits: number;
+    firstAt: number;
+    lastAt: number;
+    recentEdits: number;
+    reverted: number;
+  }> {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const recentCutoff = Math.max(Date.now() - 7 * 24 * 60 * 60 * 1000, cutoff ?? 0);
+      const rows = this.getDb().prepare(
+        `SELECT file_path, COUNT(*) AS edits, MIN(timestamp) AS first_at, MAX(timestamp) AS last_at,
+                COALESCE(SUM(CASE WHEN timestamp >= ?1 THEN 1 ELSE 0 END), 0) AS recent_edits,
+                COALESCE(SUM(CASE WHEN was_reverted = 1 THEN 1 ELSE 0 END), 0) AS reverted
+         FROM file_edits
+         WHERE (?2 IS NULL OR timestamp >= ?2)
+           AND (?3 IS NULL OR project_root = ?3)
+         GROUP BY file_path`,
+      ).all(recentCutoff, cutoff, projectRoot ?? null) as Array<{
+        file_path: string;
+        edits: number;
+        first_at: number;
+        last_at: number;
+        recent_edits: number;
+        reverted: number;
+      }>;
+      return rows.map((row) => ({
+        filePath: row.file_path,
+        edits: row.edits,
+        firstAt: row.first_at,
+        lastAt: row.last_at,
+        recentEdits: row.recent_edits,
+        reverted: row.reverted,
+      }));
+    } catch (err) {
+      log.error(`Ошибка getHotspotMetrics: ${String(err)}`);
+      return [];
+    }
+  }
+
+  /** Количество ошибок по файлам одной выборкой. */
+  getErrorCountsByFile(timeframe?: string, projectRoot?: string): Map<string, number> {
+    try {
+      const cutoff = timeframeToCutoff(timeframe);
+      const rows = this.getDb().prepare(
+        `SELECT se.context_file AS file_path, COUNT(*) AS cnt
+         FROM session_errors se
+         LEFT JOIN sessions s ON se.session_id = s.id
+         WHERE se.context_file IS NOT NULL
+           AND (?1 IS NULL OR se.timestamp >= ?1)
+           AND (?2 IS NULL OR s.project_root = ?2)
+         GROUP BY se.context_file`,
+      ).all(cutoff, projectRoot ?? null) as Array<{ file_path: string; cnt: number }>;
+      return new Map(rows.map((row) => [row.file_path, row.cnt]));
+    } catch (err) {
+      log.error(`Ошибка getErrorCountsByFile: ${String(err)}`);
+      return new Map();
     }
   }
 
@@ -1584,7 +1916,7 @@ export class StorageEngine {
           event.eventType,
           event.sessionId ?? null,
           event.filePath ?? null,
-          event.metadata ? JSON.stringify(event.metadata) : null,
+          truncateJson(event.metadata, 16000),
           event.timestamp,
         );
 
@@ -1598,36 +1930,20 @@ export class StorageEngine {
     }
   }
 
-  /** Возвращает события разработчика с фильтром по типу и времени. */
-  getDevEvents(type?: string, timeframe?: string): DeveloperEvent[] {
+  /** Возвращает события разработчика с фильтром по типу, времени и проекту. */
+  getDevEvents(type?: string, timeframe?: string, limit = 5000, projectRoot?: string): DeveloperEvent[] {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      const conditions: string[] = [];
-      const params: (string | number)[] = [];
-
-      let paramIdx = 0;
-
-      if (type) {
-        paramIdx++;
-        conditions.push(`event_type = ?${paramIdx}`);
-        params.push(type);
-      }
-
-      if (cutoff !== null) {
-        paramIdx++;
-        conditions.push(`timestamp >= ?${paramIdx}`);
-        params.push(cutoff);
-      }
-
-      let query = `SELECT * FROM developer_events`;
-      if (conditions.length > 0) {
-        query += ` WHERE ${conditions.join(" AND ")}`;
-      }
-      query += ` ORDER BY timestamp DESC`;
-
-      const rows = db.prepare(query).all(...params) as DeveloperEventRow[];
+      const rows = db.prepare(
+        `SELECT de.* FROM developer_events de
+         LEFT JOIN sessions s ON de.session_id = s.id
+         WHERE (?1 IS NULL OR de.event_type = ?1)
+           AND (?2 IS NULL OR de.timestamp >= ?2)
+           AND (?3 IS NULL OR s.project_root = ?3)
+         ORDER BY de.timestamp DESC LIMIT ?4`,
+      ).all(type ?? null, cutoff, projectRoot ?? null, limit) as DeveloperEventRow[];
       return rows.map(rowToDeveloperEvent);
     } catch (err) {
       log.error(`Ошибка getDevEvents: ${String(err)}`);
@@ -1636,20 +1952,16 @@ export class StorageEngine {
   }
 
   /** Возвращает общее количество сессий (на основе developer_events типа session_start). */
-  getSessionCount(timeframe?: string): number {
+  getSessionCount(timeframe?: string, projectRoot?: string): number {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT COUNT(*) as cnt FROM sessions`;
-      const params: number[] = [];
-
-      if (cutoff !== null) {
-        query += ` WHERE started_at >= ?1`;
-        params.push(cutoff);
-      }
-
-      const row = db.prepare(query).get(...params) as { cnt: number };
+      const row = db.prepare(
+        `SELECT COUNT(*) as cnt FROM sessions
+         WHERE (?1 IS NULL OR started_at >= ?1)
+           AND (?2 IS NULL OR project_root = ?2)`,
+      ).get(cutoff, projectRoot ?? null) as { cnt: number };
       return row.cnt;
     } catch (err) {
       log.error(`Ошибка getSessionCount: ${String(err)}`);
@@ -1711,21 +2023,17 @@ export class StorageEngine {
   // =========================================================================
 
   /** Все уникальные file_path за указанный период. */
-  getDistinctFiles(timeframe?: string): string[] {
+  getDistinctFiles(timeframe?: string, projectRoot?: string): string[] {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `SELECT DISTINCT file_path FROM file_edits`;
-      const params: number[] = [];
-
-      if (cutoff !== null) {
-        query += ` WHERE timestamp >= ?1`;
-        params.push(cutoff);
-      }
-
-      query += ` ORDER BY file_path`;
-      const rows = db.prepare(query).all(...params) as { file_path: string }[];
+      const rows = db.prepare(
+        `SELECT DISTINCT file_path FROM file_edits
+         WHERE (?1 IS NULL OR timestamp >= ?1)
+           AND (?2 IS NULL OR project_root = ?2)
+         ORDER BY file_path`,
+      ).all(cutoff, projectRoot ?? null) as { file_path: string }[];
       return rows.map((r) => r.file_path);
     } catch (err) {
       log.error(`Ошибка getDistinctFiles: ${String(err)}`);
@@ -1734,14 +2042,15 @@ export class StorageEngine {
   }
 
   /** Возвращает уникальные файлы в явном временном диапазоне [from, to). */
-  getDistinctFilesBetween(from: number, to: number): string[] {
+  getDistinctFilesBetween(from: number, to: number, projectRoot?: string): string[] {
     try {
       const db = this.getDb()
       const rows = db.prepare(
         `SELECT DISTINCT file_path FROM file_edits
          WHERE timestamp >= ?1 AND timestamp < ?2
+           AND (?3 IS NULL OR project_root = ?3)
          ORDER BY file_path`,
-      ).all(from, to) as { file_path: string }[]
+      ).all(from, to, projectRoot ?? null) as { file_path: string }[]
       return rows.map((row) => row.file_path)
     } catch (err) {
       log.error(`Ошибка getDistinctFilesBetween: ${String(err)}`)
@@ -1750,14 +2059,15 @@ export class StorageEngine {
   }
 
   /** Возвращает правки файла в явном временном диапазоне [from, to). */
-  getFileEditsBetween(filePath: string, from: number, to: number): FileEdit[] {
+  getFileEditsBetween(filePath: string, from: number, to: number, projectRoot?: string): FileEdit[] {
     try {
       const db = this.getDb()
       const rows = db.prepare(
         `SELECT * FROM file_edits
          WHERE file_path = ?1 AND timestamp >= ?2 AND timestamp < ?3
+           AND (?4 IS NULL OR project_root = ?4)
          ORDER BY timestamp DESC`,
-      ).all(filePath, from, to) as FileEditRow[]
+      ).all(filePath, from, to, projectRoot ?? null) as FileEditRow[]
       return rows.map(rowToFileEdit)
     } catch (err) {
       log.error(`Ошибка getFileEditsBetween: ${String(err)}`)
@@ -1766,14 +2076,16 @@ export class StorageEngine {
   }
 
   /** Возвращает ошибки файла в явном временном диапазоне [from, to). */
-  getErrorsForFileBetween(filePath: string, from: number, to: number): SessionError[] {
+  getErrorsForFileBetween(filePath: string, from: number, to: number, projectRoot?: string): SessionError[] {
     try {
       const db = this.getDb()
       const rows = db.prepare(
-        `SELECT * FROM session_errors
-         WHERE context_file = ?1 AND timestamp >= ?2 AND timestamp < ?3
-         ORDER BY timestamp DESC`,
-      ).all(filePath, from, to) as SessionErrorRow[]
+        `SELECT e.* FROM session_errors e
+         LEFT JOIN sessions s ON e.session_id = s.id
+         WHERE e.context_file = ?1 AND e.timestamp >= ?2 AND e.timestamp < ?3
+           AND (?4 IS NULL OR s.project_root = ?4)
+         ORDER BY e.timestamp DESC`,
+      ).all(filePath, from, to, projectRoot ?? null) as SessionErrorRow[]
       return rows.map(rowToSessionError)
     } catch (err) {
       log.error(`Ошибка getErrorsForFileBetween: ${String(err)}`)
@@ -1782,13 +2094,14 @@ export class StorageEngine {
   }
 
   /** Возвращает число сессий в явном временном диапазоне [from, to). */
-  getSessionCountBetween(from: number, to: number): number {
+  getSessionCountBetween(from: number, to: number, projectRoot?: string): number {
     try {
       const db = this.getDb()
       const row = db.prepare(
         `SELECT COUNT(*) AS cnt FROM sessions
-         WHERE started_at >= ?1 AND started_at < ?2`,
-      ).get(from, to) as { cnt: number }
+         WHERE started_at >= ?1 AND started_at < ?2
+           AND (?3 IS NULL OR project_root = ?3)`,
+      ).get(from, to, projectRoot ?? null) as { cnt: number }
       return row.cnt
     } catch (err) {
       log.error(`Ошибка getSessionCountBetween: ${String(err)}`)
@@ -1797,17 +2110,17 @@ export class StorageEngine {
   }
 
   /** Developer events в явном временном диапазоне [from, to). */
-  getDevEventsBetween(type: string | undefined, from: number, to: number): DeveloperEvent[] {
+  getDevEventsBetween(type: string | undefined, from: number, to: number, projectRoot?: string): DeveloperEvent[] {
     try {
       const db = this.getDb()
-      const params: (string | number)[] = [from, to]
-      let query = `SELECT * FROM developer_events WHERE timestamp >= ?1 AND timestamp < ?2`
-      if (type) {
-        query += ` AND event_type = ?3`
-        params.push(type)
-      }
-      query += ` ORDER BY timestamp DESC`
-      const rows = db.prepare(query).all(...params) as DeveloperEventRow[]
+      const rows = db.prepare(
+        `SELECT de.* FROM developer_events de
+         LEFT JOIN sessions s ON de.session_id = s.id
+         WHERE de.timestamp >= ?1 AND de.timestamp < ?2
+           AND (?3 IS NULL OR de.event_type = ?3)
+           AND (?4 IS NULL OR s.project_root = ?4)
+         ORDER BY de.timestamp DESC`,
+      ).all(from, to, type ?? null, projectRoot ?? null) as DeveloperEventRow[]
       return rows.map(rowToDeveloperEvent)
     } catch (err) {
       log.error(`Ошибка getDevEventsBetween: ${String(err)}`)
@@ -1821,22 +2134,21 @@ export class StorageEngine {
   getEditFrequency(
     filePath: string,
     timeframe?: string,
+    projectRoot?: string,
   ): { total: number; perDay: number } {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
-
-      let whereClause = `WHERE file_path = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        whereClause += ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
+      const root = projectRoot ?? null;
 
       const countRow = db
-        .prepare(`SELECT COUNT(*) AS cnt FROM file_edits ${whereClause}`)
-        .get(...params) as { cnt: number };
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM file_edits
+           WHERE file_path = ?1
+             AND (?2 IS NULL OR timestamp >= ?2)
+             AND (?3 IS NULL OR project_root = ?3)`,
+        )
+        .get(filePath, cutoff, root) as { cnt: number };
 
       const total = countRow.cnt;
 
@@ -1851,9 +2163,10 @@ export class StorageEngine {
         const span = db
           .prepare(
             `SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
-             FROM file_edits WHERE file_path = ?1`,
+             FROM file_edits WHERE file_path = ?1
+               AND (?2 IS NULL OR project_root = ?2)`,
           )
-          .get(filePath) as { first_ts: number | null; last_ts: number | null };
+          .get(filePath, root) as { first_ts: number | null; last_ts: number | null };
         if (span.first_ts && span.last_ts && span.last_ts > span.first_ts) {
           days = Math.max(
             1,
@@ -1871,7 +2184,7 @@ export class StorageEngine {
   }
 
   /** Количество зависимостей файла (рёбра графа знаний, где файл — источник или цель). */
-  getDependencyCount(filePath: string): number {
+  getDependencyCount(filePath: string, projectRoot?: string): number {
     try {
       const db = this.getDb();
       const row = db
@@ -1880,9 +2193,15 @@ export class StorageEngine {
            FROM knowledge_edges ke
            JOIN knowledge_nodes kn_src ON ke.source_id = kn_src.id
            JOIN knowledge_nodes kn_tgt ON ke.target_id = kn_tgt.id
-           WHERE kn_src.path = ?1 OR kn_tgt.path = ?2`,
+           WHERE (
+             kn_src.path = ?1
+             AND (?2 IS NULL OR kn_src.project_root = ?2 OR kn_src.project_root IS NULL)
+           ) OR (
+             kn_tgt.path = ?1
+             AND (?2 IS NULL OR kn_tgt.project_root = ?2 OR kn_tgt.project_root IS NULL)
+           )`,
         )
-        .get(filePath, filePath) as { cnt: number };
+        .get(filePath, projectRoot ?? null) as { cnt: number };
       return row.cnt;
     } catch (err) {
       log.error(`Ошибка getDependencyCount: ${String(err)}`);
@@ -1897,39 +2216,38 @@ export class StorageEngine {
   getHistoricalBreakageRate(
     filePath: string,
     timeframe?: string,
+    projectRoot?: string,
   ): number {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
-
-      let errorFilter = "";
-      let editFilter = "";
-      const params: number[] = [];
-
-      if (cutoff !== null) {
-        errorFilter = ` AND timestamp >= ?2`;
-        editFilter = ` AND timestamp >= ?2`;
-        params.push(cutoff);
-      }
+      const root = projectRoot ?? null;
 
       const errorRow = db
         .prepare(
-          `SELECT COUNT(DISTINCT session_id) AS cnt
-           FROM session_errors
-           WHERE context_file = ?1${errorFilter}`,
+          `SELECT COUNT(DISTINCT se.session_id) AS cnt
+           FROM session_errors se
+           LEFT JOIN sessions s ON se.session_id = s.id
+           WHERE se.context_file = ?1
+             AND (?2 IS NULL OR se.timestamp >= ?2)
+             AND (?3 IS NULL OR s.project_root = ?3)`,
         )
-        .get(filePath, ...params) as { cnt: number };
+        .get(filePath, cutoff, root) as { cnt: number };
 
       const totalRow = db
         .prepare(
           `SELECT COUNT(DISTINCT session_id) AS cnt
            FROM file_edits
-           WHERE file_path = ?1${editFilter}`,
+           WHERE file_path = ?1
+             AND (?2 IS NULL OR timestamp >= ?2)
+             AND (?3 IS NULL OR project_root = ?3)`,
         )
-        .get(filePath, ...params) as { cnt: number };
+        .get(filePath, cutoff, root) as { cnt: number };
 
       if (totalRow.cnt === 0) return 0;
-      return parseFloat((errorRow.cnt / totalRow.cnt).toFixed(4));
+      // Error sessions are counted independently from edit sessions, so the
+      // raw ratio can exceed 1. A probability must stay in [0, 1].
+      return Math.max(0, Math.min(1, parseFloat((errorRow.cnt / totalRow.cnt).toFixed(4))));
     } catch (err) {
       log.error(`Ошибка getHistoricalBreakageRate: ${String(err)}`);
       return 0;
@@ -1941,27 +2259,23 @@ export class StorageEngine {
     filePath: string,
     timeframe?: string,
     limit = 5,
+    projectRoot?: string,
   ): Session[] {
     try {
       const db = this.getDb();
       const cutoff = timeframeToCutoff(timeframe);
 
-      let query = `
-        SELECT DISTINCT s.*
-        FROM sessions s
-        JOIN file_edits fe ON s.id = fe.session_id
-        WHERE fe.file_path = ?1`;
-      const params: (string | number)[] = [filePath];
-
-      if (cutoff !== null) {
-        query += ` AND fe.timestamp >= ?2`;
-        params.push(cutoff);
-      }
-
-      query += ` ORDER BY fe.timestamp DESC LIMIT ?3`;
-      params.push(limit);
-
-      const rows = db.prepare(query).all(...params) as SessionRow[];
+      // GROUP BY makes the session unique and MAX(fe.timestamp) gives a
+      // deterministic "most recently touched" ordering.
+      const rows = db.prepare(
+        `SELECT s.*
+         FROM sessions s
+         JOIN file_edits fe ON s.id = fe.session_id
+         WHERE fe.file_path = ?1
+           AND (?2 IS NULL OR fe.timestamp >= ?2)
+           AND (?3 IS NULL OR s.project_root = ?3)
+         GROUP BY s.id ORDER BY MAX(fe.timestamp) DESC LIMIT ?4`,
+      ).all(filePath, cutoff, projectRoot ?? null, limit) as SessionRow[];
       return rows.map(rowToSession);
     } catch (err) {
       log.error(`Ошибка getRecentSimilarChanges: ${String(err)}`);
@@ -1990,9 +2304,12 @@ export class StorageEngine {
   runCleanup(retentionDays: number, sessionRetentionDays: number): void {
     try {
       const db = this.getDb();
-      const rawCutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+      const safeRetention = Number.isFinite(retentionDays) ? Math.max(1, retentionDays) : 90;
+      const safeSessionRetention = Number.isFinite(sessionRetentionDays) ? Math.max(1, sessionRetentionDays) : 365;
+      const rawCutoff = Date.now() - safeRetention * 24 * 60 * 60 * 1000;
       const sessionCutoff =
-        Date.now() - sessionRetentionDays * 24 * 60 * 60 * 1000;
+        Date.now() - safeSessionRetention * 24 * 60 * 60 * 1000;
+      const expiredSessions = `SELECT id FROM sessions WHERE started_at < ?1 AND status IN ('deleted','compacted','idle','error')`;
 
       db.transaction(() => {
         // Удаляем старые сырые события
@@ -2001,18 +2318,43 @@ export class StorageEngine {
         db.prepare(`DELETE FROM session_errors WHERE timestamp < ?1`).run(rawCutoff);
         db.prepare(`DELETE FROM developer_events WHERE timestamp < ?1`).run(rawCutoff);
 
-        // Сессии храним дольше — удаляем только удалённые/сжатые старше порога
+        // Сессии храним дольше. Child rows with FK references must be removed
+        // first, otherwise the whole cleanup transaction rolls back.
+        db.prepare(`DELETE FROM todos WHERE session_id IN (${expiredSessions})`).run(sessionCutoff);
+        db.prepare(`DELETE FROM session_errors WHERE session_id IN (${expiredSessions})`).run(sessionCutoff);
+        db.prepare(`DELETE FROM sessions WHERE id IN (${expiredSessions})`).run(sessionCutoff);
+
+        // Agent-native state grows without bound if only raw tables are pruned.
+        // Keep active/open records forever, drop only terminal records older
+        // than the session retention window.
+        const terminalTasks = `SELECT id FROM agent_tasks WHERE status IN ('completed','cancelled') AND updated_at < ?1`;
+        db.prepare(`DELETE FROM task_steps WHERE task_id IN (${terminalTasks})`).run(sessionCutoff);
+        db.prepare(`DELETE FROM agent_tasks WHERE id IN (${terminalTasks})`).run(sessionCutoff);
         db.prepare(
-          `DELETE FROM sessions WHERE started_at < ?1 AND status IN ('deleted','compacted')`,
+          `DELETE FROM evidence_records WHERE status IN ('verified','failed') AND created_at < ?1`,
+        ).run(sessionCutoff);
+        db.prepare(
+          `DELETE FROM failure_memory WHERE status IN ('resolved','dismissed') AND created_at < ?1`,
+        ).run(sessionCutoff);
+        db.prepare(
+          `DELETE FROM change_contracts WHERE status IN ('passed','closed') AND updated_at < ?1`,
+        ).run(sessionCutoff);
+        db.prepare(
+          `DELETE FROM contradiction_records WHERE status IN ('resolved','accepted') AND created_at < ?1`,
+        ).run(sessionCutoff);
+        db.prepare(
+          `DELETE FROM agent_handoffs WHERE status = 'completed' AND created_at < ?1`,
         ).run(sessionCutoff);
 
-        // Чистим устаревший кеш
+        // Чистим устаревший кеш и provenance-события
+        const cacheCutoff = Date.now() - Math.max(safeRetention, 7) * 24 * 60 * 60 * 1000;
         db.prepare(
-          `DELETE FROM analytics_cache WHERE valid_until IS NOT NULL AND valid_until < ?1`,
-        ).run(Date.now());
+          `DELETE FROM analytics_cache WHERE (valid_until IS NOT NULL AND valid_until < ?1) OR computed_at < ?2`,
+        ).run(Date.now(), cacheCutoff);
+        db.prepare(`DELETE FROM provenance_events WHERE created_at < ?1`).run(rawCutoff);
 
         log.info(
-          `Очистка выполнена: события старше ${retentionDays}д, сессии старше ${sessionRetentionDays}д.`,
+          `Очистка выполнена: события старше ${safeRetention}д, сессии старше ${safeSessionRetention}д.`,
         );
       })();
     } catch (err) {
@@ -2045,6 +2387,15 @@ export class StorageEngine {
         "knowledge_edges",
         "developer_events",
         "analytics_cache",
+        "todos",
+        "agent_tasks",
+        "task_steps",
+        "evidence_records",
+        "failure_memory",
+        "change_contracts",
+        "contradiction_records",
+        "provenance_events",
+        "agent_handoffs",
         "schema_version",
       ];
 
@@ -2080,40 +2431,69 @@ export class StorageEngine {
     if (this.batchQueue.length >= this.config.batchSize) {
       this.flushBatch();
     }
+
+    // An unbounded queue is a memory leak when the DB is unavailable. Drop the
+    // oldest 10% after a failed flush instead of growing forever.
+    if (this.batchQueue.length >= MAX_BATCH_QUEUE_SIZE) {
+      this.flushBatch();
+      if (this.batchQueue.length >= MAX_BATCH_QUEUE_SIZE) {
+        const dropCount = Math.ceil(this.batchQueue.length * 0.1);
+        this.batchQueue.splice(0, dropCount);
+        log.warn(`Очередь переполнена: отброшено ${dropCount} самых старых записей.`);
+      }
+    }
   }
 
   /**
    * Сбрасывает всю очередь пакетной записи в БД одной транзакцией.
+   * Если batch падает на одной строке, выполняется построчная запись:
+   * валидные строки сохраняются, «отравленные» отклоняются и логируются,
+   * очередь не блокируется навсегда.
    */
   flushBatch(): void {
     if (this.batchQueue.length === 0) return;
 
-    const items = [...this.batchQueue];
+    const items = this.batchQueue;
+    this.batchQueue = [];
 
+    const insertRow = (db: Database, item: BatchQueueItem): void => {
+      const columns = Object.keys(item.row);
+      const placeholders = columns.map((_, index) => `?${index + 1}`).join(", ");
+      const values = Object.values(item.row);
+      // Экранируем имя таблицы (безопасно, так как table задаётся кодом)
+      const query = `INSERT INTO "${item.table}" (${columns.map((column) => `"${column}"`).join(", ")}) VALUES (${placeholders})`;
+      db.prepare(query).run(...(values as any));
+    };
+
+    let db: Database;
     try {
-      const db = this.getDb();
-      this.batchQueue = [];
-
-      db.transaction(() => {
-        for (const item of items) {
-          const columns = Object.keys(item.row);
-          const placeholders = columns.map((_, i) => `?${i + 1}`).join(", ");
-          const values = Object.values(item.row);
-
-          // Экранируем имя таблицы (безопасно, так как table задаётся кодом)
-          const query = `INSERT INTO "${item.table}" (${columns.map((c) => `"${c}"`).join(", ")}) VALUES (${placeholders})`;
-
-          // Ошибка отдельной записи должна откатить весь batch. Иначе
-          // вызывающий код считает запись успешной, а данные бесшумно теряются.
-          db.prepare(query).run(...(values as any));
-        }
-      })();
-
-      log.info(`Пакетная запись: ${items.length} строк сброшено в БД.`);
+      db = this.getDb();
     } catch (err) {
       log.error(`Ошибка flushBatch: ${String(err)}`);
-      // Возвращаем элементы, чтобы временная ошибка БД не уничтожила события.
+      // Очередь ещё не очищена — возвращаем захваченные элементы.
       this.batchQueue = [...items, ...this.batchQueue];
+      return;
+    }
+
+    try {
+      db.transaction(() => {
+        for (const item of items) insertRow(db, item);
+      })();
+      log.info(`Пакетная запись: ${items.length} строк сброшено в БД.`);
+    } catch (err) {
+      log.error(`Ошибка flushBatch (batch): ${String(err)}. Перехожу к построчной записи.`);
+      let saved = 0;
+      let rejected = 0;
+      for (const item of items) {
+        try {
+          db.transaction(() => insertRow(db, item))();
+          saved += 1;
+        } catch (rowErr) {
+          rejected += 1;
+          log.error(`flushBatch: строка отклонена (таблица ${item.table}): ${String(rowErr)}`);
+        }
+      }
+      log.warn(`flushBatch: сохранено ${saved}, отклонено ${rejected}.`);
     }
   }
 }

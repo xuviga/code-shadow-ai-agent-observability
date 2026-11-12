@@ -11,6 +11,10 @@ import { EvidenceStatus, TaskStatus, TaskStepStatus, TrustLevel } from "../types
 import { sanitizeContent } from "../config"
 import { createLogger } from "../logger"
 
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value))
+}
+
 function projectRoot(storage: StorageEngine, context: Record<string, unknown>, explicit?: string): string {
   if (explicit) return explicit
   const sessionId = context.sessionID as string | undefined
@@ -60,13 +64,24 @@ export function createAgentTools(
         try {
           if (args.action === "create") {
             if (!args.title || !args.goal) return output({ error: "title и goal обязательны" })
+            if (args.status === TaskStatus.Completed) {
+              return output({ error: "Нельзя создать задачу сразу completed. Создай active и закрой через complete после Definition of Done." })
+            }
             const task = storage.createTask({ projectRoot: root, sessionId: sid, title: clean(args.title, config)!, goal: clean(args.goal, config)!, status: (args.status || TaskStatus.Active) as TaskStatus, priority: args.priority ?? 50, metadata: null })
             return output({ task, message: "Задача создана. Теперь добавь шаги и веди evidence." })
           }
           if (args.action === "list") return output({ tasks: storage.listTasks(root, args.status, 30) })
           if (!args.task_id) return output({ error: "task_id обязателен для этого действия" })
           if (args.action === "get") return output({ task: storage.getTask(args.task_id), steps: storage.listTaskSteps(args.task_id) })
-          if (args.action === "update") return output({ task: storage.updateTask(args.task_id, { title: args.title, goal: args.goal, status: args.status as TaskStatus | undefined, priority: args.priority }) })
+          if (args.action === "update") {
+            // Completing through "update" must respect the same Definition of
+            // Done gate as the explicit "complete" action.
+            if (args.status === TaskStatus.Completed) {
+              const definition = storage.evaluateTaskDone(args.task_id)
+              if (!definition.ready) return output({ task: storage.getTask(args.task_id), definition_of_done: definition, message: "Задача не завершена: сначала устрани blockers и добавь verified evidence." })
+            }
+            return output({ task: storage.updateTask(args.task_id, { title: args.title, goal: args.goal, status: args.status as TaskStatus | undefined, priority: args.priority }) })
+          }
           if (args.action === "add_step") {
             if (!args.step_title) return output({ error: "step_title обязателен" })
             const position = storage.listTaskSteps(args.task_id).length
@@ -75,7 +90,7 @@ export function createAgentTools(
           }
           if (args.action === "complete_step") {
             if (!args.step_id) return output({ error: "step_id обязателен" })
-            return output({ step: storage.updateTaskStep(args.step_id, args.step_status || TaskStepStatus.Completed, args.blocked_by || null) })
+            return output({ step: storage.updateTaskStep(args.step_id, args.step_status || TaskStepStatus.Completed, args.blocked_by ?? null) })
           }
           if (args.action === "done_check") return output({ task_id: args.task_id, definition_of_done: storage.evaluateTaskDone(args.task_id) })
           if (args.action === "complete") {
@@ -178,8 +193,15 @@ export function createAgentTools(
         if (args.action === "list") return output({ contracts: storage.listChangeContracts(root, args.task_id) })
         if (!args.contract_id && args.action !== "create") return output({ error: "contract_id обязателен" })
         if (args.action === "get") return output({ contract: storage.getChangeContract(args.contract_id!) })
-        if (args.action === "check") return output(storage.checkChangeContract(args.contract_id!, args.changed_paths || []))
-        if (args.action === "close") return output({ contract: storage.updateChangeContract(args.contract_id!, { status: "closed" }) })
+        if (args.action === "check") {
+          if (!args.changed_paths || args.changed_paths.length === 0) return output({ error: "changed_paths обязателен: пустая проверка не подтверждает compliance" })
+          return output(storage.checkChangeContract(args.contract_id!, args.changed_paths))
+        }
+        if (args.action === "close") {
+          const contract = storage.getChangeContract(args.contract_id!)
+          if (contract?.status === "violated") return output({ contract, error: "Контракт нарушен: устрани violations и проверь контракт заново." })
+          return output({ contract: storage.updateChangeContract(args.contract_id!, { status: "closed" }) })
+        }
         if (!args.goal) return output({ error: "goal обязателен" })
         return output({ contract: storage.createChangeContract({
           projectRoot: root, taskId: args.task_id || null, sessionId: sid, goal: clean(args.goal, config)!,
@@ -199,13 +221,21 @@ export function createAgentTools(
         const tasks = storage.listTasks(root, undefined, limit)
         const selectedTask = args.task_id ? storage.getTask(args.task_id) : tasks.find((item) => item.status === "active") || tasks[0]
         const query = args.query || selectedTask?.goal || selectedTask?.title || ""
-        const memories = phase === "verify" ? [] : query ? storage.searchNodes(query, limit) : []
+        const memories = phase === "verify" ? [] : query ? storage.searchNodes(query, limit, root) : []
+        const architecture = phase === "explore"
+          ? [...storage.getNodesByType("module", root), ...storage.getNodesByType("concept", root)].slice(0, limit)
+          : []
+        const handoff = phase === "handoff" ? storage.listHandoffs(root, "open", 1)[0] || null : null
         const behavior = storage.queryRows<{ tool_name: string; calls: number; errors: number }>(`SELECT tool_name, COUNT(*) AS calls, SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS errors FROM tool_executions te JOIN sessions s ON s.id = te.session_id WHERE s.project_root = ?1 GROUP BY tool_name ORDER BY calls DESC LIMIT ?2`, root, limit)
+        const openFailures = storage.searchFailures(root, query, limit)
+          .filter((item) => item.status === "open" && (!selectedTask || item.taskId === selectedTask.id || !item.taskId))
         return output({
           project_root: root, phase, context_budget: { limit, strategy: phase === "explore" ? "architecture_and_memory" : phase === "verify" ? "evidence_and_risk" : phase === "handoff" ? "continuation_state" : "task_and_change_state" }, selected_task: selectedTask || null,
           steps: selectedTask ? storage.listTaskSteps(selectedTask.id) : [],
           tasks, evidence: storage.listEvidence(root, selectedTask?.id, limit),
-          open_failures: storage.searchFailures(root, query, limit).filter((item) => item.status === "open"),
+          architecture,
+          handoff,
+          open_failures: openFailures,
           contracts: storage.listChangeContracts(root, selectedTask?.id).filter((item) => item.status === "active"),
           contradictions: storage.listContradictions(root, "open", limit),
           memories, behavior,
@@ -229,7 +259,7 @@ export function createAgentTools(
         const limit = args.limit || 8
         const query = args.query || (args.task_id ? storage.getTask(args.task_id)?.goal : "") || ""
         const discovered = query
-          ? storage.searchNodes(query, limit).map((node) => node.path).filter((path): path is string => Boolean(path))
+          ? storage.searchNodes(query, limit, root).map((node) => node.path).filter((path): path is string => Boolean(path))
           : []
         const seeds = Array.from(new Set([...(args.files || []), ...discovered])).slice(0, limit)
         if (seeds.length === 0) return output({ project_root: root, query, impacted_files: [], message: "Не найдено файлов для counterfactual анализа. Передай files или query с именем модуля." })
@@ -346,7 +376,20 @@ export function createAgentTools(
         if ((row?.open_failures || 0) > 0) warnings.push("есть открытые failure memories")
         if ((row?.violated_contracts || 0) > 0) warnings.push("есть нарушенные change contracts")
         if ((row?.contradictions || 0) > 0) warnings.push("есть неразрешённые противоречия")
-        return output({ project_root: root, quality: row || {}, warnings, recommendation: args.action === "risk" ? "Сначала resolve failures/contradictions, затем verify evidence и повторно проверь contract." : "Используй этот срез для выбора следующего действия агента." })
+        if (args.action === "risk") {
+          const verified = row?.verified_evidence || 0
+          const unverified = row?.unverified_evidence || 0
+          const unverifiedShare = verified + unverified === 0 ? 0 : unverified / (verified + unverified)
+          const riskScore = clamp01(
+            (row?.open_failures || 0) * 0.2 +
+            (row?.violated_contracts || 0) * 0.3 +
+            (row?.contradictions || 0) * 0.2 +
+            unverifiedShare * 0.3,
+          )
+          const level = riskScore >= 0.66 ? "high" : riskScore >= 0.33 ? "medium" : "low"
+          return output({ project_root: root, risk: { score: Math.round(riskScore * 100) / 100, level, unverified_share: Math.round(unverifiedShare * 100) / 100 }, signals: warnings, recommendation: "Сначала resolve failures/contradictions, затем verify evidence и повторно проверь contract." })
+        }
+        return output({ project_root: root, quality: row || {}, warnings, recommendation: "Используй этот срез для выбора следующего действия агента." })
       },
     }),
 

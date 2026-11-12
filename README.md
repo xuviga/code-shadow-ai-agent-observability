@@ -349,18 +349,20 @@ Code Shadow **не** предназначен для:
 Live-статистика в правом сайдбаре OpenCode:
 
 - **Здоровье проекта** (0–100%, цветовой индикатор: зелёный/жёлтый/красный)
-- **Длительность последней сессии** (минуты:секунды)
-- **Сетка StatBox 2×2**: сессии, правки, ошибки, файлы
-- **Активность**: количество файлов и правок в текущей сессии
-- Обновляется в реальном времени при каждом событии
+- **Сводка**: сессии, правки, ошибки, файлы; инструменты, память, hotspots, ADRs;
+  задачи, evidence, failures, contracts
+- **Hotspots 30d**: top-3 файла по числу правок и ошибок
+- **Activity**: последние 6 правок проекта
+- Обновляется по событиям и polling каждые 5 секунд
 
 ### 🔄 Per-project TUI
 
 Сайдбар показывает статистику **текущего проекта**, а не глобальную.
 Фильтрация через `project_root` из таблицы `sessions`:
 
-- **Домашний экран** (без активной сессии) — глобальная статистика по всем проектам
-- **Внутри сессии** — статистика только для текущего проекта
+- **Без активной сессии** — empty state «No project data»
+- **Внутри сессии** — статистика только для текущего проекта; память и ADR
+  включают глобальные legacy-узлы (`project_root = NULL`)
 - **Реактивное обновление**: polling каждые 5 секунд через `createSignal` (SolidJS)
 
 ### 🤖 Автономный AI
@@ -372,15 +374,15 @@ CRUSH.md заставляет AI самостоятельно использов
 
 Отдельная статистика для каждого проекта. Данные не смешиваются:
 - Сессии помечаются `project_root` при создании
-- TUI-панель фильтрует метрики по текущему проекту
-- Hotspots, граф знаний, профиль разработчика — per-project
+- TUI-панель, hotspots, аналитика, контекст и память фильтруются по текущему проекту
+- Граф зависимостей доступен через `code_shadow_analyze`, а не в TUI-панели
 
 ### 🛡️ SQL-безопасность
 
 Все запросы к БД защищены:
-- **Параметризованные запросы** — никакой конкатенации SQL-строк
-- **WAL-режим** — конкурентное чтение и запись без блокировок (server + TUI читают одну БД)
-- **Graceful shutdown** — при завершении: финализация сессий, сброс буфера, `wal_checkpoint(TRUNCATE)`, закрытие соединения
+- **Параметризованные запросы** — без конкатенации значений в SQL
+- **WAL + busy_timeout** — конкурентное чтение/запись (server и TUI читают одну БД)
+- **Graceful shutdown** — сброс batch-очереди и закрытие соединения
 - **Фильтрация секретов** — .env, ключи, токены не сохраняются в БД
 
 ### 🔔 Toast-уведомления
@@ -388,9 +390,9 @@ CRUSH.md заставляет AI самостоятельно использов
 Предупреждения при рискованных изменениях прямо в интерфейсе OpenCode:
 
 - **Pre-edit warnings** — перед применением правок к файлам с высокой «температурой»
-- **Breakage prediction** — «Это изменение с вероятностью 58% сломает тесты»
-- **Regression alerts** — «Файл имеет историю регрессий. Последние 3 изменения создали 2 новых бага»
-- Настраиваемые пороги срабатывания через конфиг плагина
+- **Risk toast** — уровень риска, score и число зависимостей / недавняя поломка
+- Настраиваемые пороги `riskWarningThreshold` / `riskErrorThreshold`
+- `/shadow hotspots|predict|stats|health|tui` через событие `tui.prompt.append`
 
 ### 🔭 Silent Observer (Безмолвный Наблюдатель)
 
@@ -491,7 +493,11 @@ CRUSH.md заставляет AI самостоятельно использов
 
 ### 📊 Developer Wrapped (Итоги разработчика)
 
-Персональная статистика за месяц или год в духе Spotify Wrapped.
+> **Статус:** реализован только базовый срез `my_stats` (sessions/day, средняя
+> длительность, top files, AI reliance, fix rate, tool usage). Рекорды, тренды,
+> сравнение периодов и ачивки ниже — **план, не текущая функциональность**.
+
+Персональная статистика за месяц или год в духе Spotify Wrapped (план).
 
 - **Общая статистика**:
   - Строк кода написано / удалено
@@ -647,7 +653,7 @@ git clone https://github.com/xuviga/code-shadow-ai-agent-observability.git ~/.co
 
 | Компонент | Требование |
 |-----------|-----------|
-| **Bun** | >= 1.1.0 (для `bun:sqlite`) |
+| **Bun** | >= 1.3.0 (для `bun:sqlite`) |
 | **OpenCode** | >= 1.0.0 |
 | **Git** | >= 2.30 (опционально, для git-событий) |
 | **Диск** | ~50 MB на месяц активной работы |
@@ -694,7 +700,7 @@ git clone https://github.com/xuviga/code-shadow-ai-agent-observability.git ~/.co
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │               📊 Storage Engine (SQLite/WAL)          │   │
 │  │                                                      │   │
-│  │  • 11 таблиц: события, память, решения, todos      │   │
+│  │  • 19 таблиц: события, память, решения, tasks/evidence  │   │
 │  │    tool_executions, decisions, knowledge_nodes,      │   │
 │  │    knowledge_edges, developer_events,                │   │
 │  │    analytics_cache, schema_version                   │   │
@@ -703,7 +709,7 @@ git clone https://github.com/xuviga/code-shadow-ai-agent-observability.git ~/.co
 │  └──────────────────────┬───────────────────────────────┘   │
 │                         ▼                                    │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │           🧰 AI Tools (7 тулзов)                      │   │
+│  │           🧰 AI Tools (16 тулзов)                     │   │
 │  │                                                      │   │
 │  │  • code_shadow_analyze (9 режимов)                  │   │
 │  │  • code_shadow_memory_write/search/note              │   │
@@ -895,7 +901,7 @@ Observer: session.compacted
 | **Внешнее облако** | Нарушает принцип zero-config и локальной конфиденциальности |
 | **Redis** | SQLite WAL-режим решает проблему конкурентного доступа без отдельного сервиса |
 | **better-sqlite3** | Требует Node.js и нативные модули; `bun:sqlite` встроен в Bun и не требует компиляции |
-| **ORM (Prisma/Drizzle)** | Избыточно для 11 таблиц; сырой SQL через `bun:sqlite` проще и быстрее |
+| **ORM (Prisma/Drizzle)** | Избыточно для 19 таблиц; сырой SQL через `bun:sqlite` проще и быстрее |
 
 ---
 
@@ -918,7 +924,7 @@ Observer: session.compacted
 | 2. Memory Engine | ✅ Полная замена Magic Context |
 | 3. Analytics Engine | ✅ 9 режимов анализа |
 | 4. Proactive Alerts | ✅ Toast + /shadow |
-| 5. Developer Wrapped | ✅ my_stats |
+| 5. Developer Wrapped | ⚠️ Частично: базовый `my_stats` (без трендов/ачивок) |
 | 6. Auto-Memory | ✅ 80+ правил авто-детекта |
 | 7. TUI Panel | ✅ Реактивная (polling 5с), per-project |
 | 8. Autonomy | ✅ CRUSH.md, AI сам вызывает тулзы |
@@ -930,7 +936,7 @@ Observer: session.compacted
 
 - [x] Базовая структура плагина (`index.ts`, `package.json`, `tsconfig.json`)
 - [x] Подключение к OpenCode Plugin SDK (`@opencode-ai/plugin`)
-- [x] Схема БД: 11 таблиц после миграции v5 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`)
+- [x] Схема БД: 19 таблиц после миграции v10 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`)
 - [x] Подписка на событие `file.edited` (прямой именованный хук + авто-детект фактов)
 - [x] Подписка на событие `session.created` / `session.idle` / `session.error` / `session.compacted`
 - [x] Подписка на событие `tool.execute.before` / `tool.execute.after`
@@ -938,13 +944,13 @@ Observer: session.compacted
 - [x] Подписка на событие `command.executed` / `message.updated` / `todo.updated`
 - [x] Миграции v2: фикс CHECK constraint на `session_completed`, `todo_completed`, `lsp_diagnostic`
 - [x] Логирование в файл (`~/.config/opencode/shadow/shadow.log`)
-- [x] Команда `/shadow status`
+- [x] Команды `/shadow hotspots|predict|stats|health|tui`
 
 #### Фаза 2 — Memory Engine ✅
 
 - [x] `code_shadow_memory_write` — запись фактов и ADR-решений
 - [x] `code_shadow_memory_search` — поиск по памяти, графу знаний и истории
-- [x] `code_shadow_memory_note` — создание/чтение/обновление заметок
+- [x] `code_shadow_memory_note` — создание заметок (чтение/закрытие — план)
 - [x] `code_shadow_context_inject` — инъекция контекста в сессию
 - [x] Полная замена Magic Context (память, поиск, заметки, инъекция)
 
@@ -952,8 +958,8 @@ Observer: session.compacted
 
 - [x] Hotspot Calculator: Bugginess Score, Edit Frequency, Regression Rate, Frustration Index
 - [x] Prediction Engine: эвристический Risk Score, Breakage Probability
-- [x] Knowledge Graph: co-change, импорты из диффов, причинно-следственные связи
-- [x] Developer Profile: AI-Reliance Ratio, Fix Rate, тренды, топ файлов
+- [x] Knowledge Graph: co-change, индексатор импортов из файлов (regex), рёбра графа
+- [x] Developer Profile: AI-Reliance Ratio, Fix Rate, топ файлов (без трендов)
 - [x] `code_shadow_analyze` — единый тулз для всей аналитики (`hotspots`, `predict_change`, `file_history`, `team_pulse`, `my_stats`, `dependency_graph`, `knowledge_search`)
 
 #### Фаза 4 — Proactive Alerts ✅
@@ -963,15 +969,16 @@ Observer: session.compacted
 - [x] Настраиваемые пороги предупреждений (`warningThreshold`)
 - [x] Risk score → предупреждение при превышении порога
 - [x] Команды `/shadow hotspots`, `/shadow predict`, `/shadow stats`, `/shadow health`
-- [x] Инъекция контекста при компактизации (`session.compacted`)
+- [x] Инъекция контекста при компактизации (`experimental.session.compacting`)
 
-#### Фаза 5 — Developer Wrapped ✅
+#### Фаза 5 — Developer Wrapped ⚠️ Частично
 
-- [x] `my_stats` в `code_shadow_analyze` — полный профиль разработчика
-- [x] Месячная и годовая статистика (сессии, правки, ошибки)
-- [x] Тренды: bugs-per-change, time-to-fix, AI-usage
-- [x] Сравнение с прошлым периодом
-- [x] Система ачивок и бейджей (Чистильщик, Экстерминатор, AI-напарник, Огнеупорный, Документатор)
+- [x] `my_stats` в `code_shadow_analyze` — базовый профиль (sessions/day,
+  средняя длительность, top files, AI reliance, fix rate, tool usage)
+- [ ] Месячная и годовая статистика как отдельный отчёт
+- [ ] Тренды: bugs-per-change, time-to-fix, AI-usage
+- [ ] Сравнение с прошлым периодом
+- [ ] Система ачивок и бейджей (Чистильщик, Экстерминатор, AI-напарник, Огнеупорный, Документатор)
 
 #### Фаза 6 — Auto-Memory ✅
 
@@ -983,15 +990,16 @@ Observer: session.compacted
 
 #### Фаза 7 — TUI Panel ✅
 
-- [x] Отдельный TUI-плагин (`tui-plugin.tsx`, регистрируется через `tui.jsonc`)
+- [x] Отдельный TUI-плагин (`tui-plugin.tsx`, регистрируется через `tui.json`)
 - [x] Слот `sidebar_content`, order 700
 - [x] Индикатор здоровья проекта (0–100%, цветовой)
-- [x] Длительность последней сессии
-- [x] Сетка StatBox 2×2: сессии, правки, ошибки, файлы
-- [x] Активность: файлов · правок в реальном времени
-- [x] Рендеринг через `@opentui/solid` JSX, функция `look()` для цветовой схемы
+- [x] Сводка: сессии, правки, ошибки, файлы; tools/memory/hotspots/ADRs;
+  tasks/evidence/failures/contracts
+- [x] Hotspots 30d (top-3) и Activity (последние 6 правок)
+- [x] Рендеринг через `@opentui/solid` JSX, функция `theme()` для цветовой схемы
 - [x] Polling 5 секунд через `createSignal` (SolidJS реактивность)
 - [x] Per-project фильтрация через `project_root` из таблицы sessions
+- [x] Отдельный typecheck панели: `npm run typecheck:tui`
 
 #### Фаза 8 — Autonomy ✅
 
@@ -1068,30 +1076,39 @@ code-shadow/
 │   ├── observer.ts           # Observer Engine: 12 обработчиков + Auto-Memory
 │   ├── storage.ts            # Storage Engine: SQLite/WAL, миграции, CRUD + batch
 │   ├── tui.ts                # TUI-интеграция: /shadow, toast, контекст
-│   ├── tui-plugin.tsx         # SolidJS панель в сайдбаре
 │   ├── types.ts              # Все TypeScript-интерфейсы и enum'ы
 │   ├── config.ts             # Загрузка конфига, фильтрация секретов
-│   ├── install.ts            # Авто-установка (bun-скрипт)
+│   ├── path-match.ts         # Glob-матчер для Change Contract (*, **, Windows)
+│   ├── import-graph.ts       # Индексатор импортов для dependency_graph
 │   ├── logger.ts             # Файловый логгер
 │   ├── tools/
 │   │   ├── analyze.ts        # code_shadow_analyze (9 режимов)
 │   │   ├── memory.ts         # memory_write/search/note
 │   │   ├── context.ts        # code_shadow_context_inject
-│   │   └── decide.ts         # code_shadow_decide
+│   │   ├── decide.ts         # code_shadow_decide
+│   │   └── agent.ts          # 10 agent-native инструментов
 │   └── migrations/
 │       ├── 001_initial.ts    # Начальная схема + индексы
 │       ├── 002_fix_event_types.ts
 │       ├── 003_lsp_error_type.ts
 │       ├── 004_explore_agent_type.ts
-│       └── 005_add_todos.ts
-├── tui-plugin.tsx             # Корневой TUI-плагин (расширенная панель)
-├── tui.jsonc                  # Конфиг TUI-плагина
+│       ├── 005_add_todos.ts
+│       ├── 006_agent_native.ts
+│       ├── 007_restore_error_file_index.ts
+│       ├── 008_project_scope.ts
+│       └── 009_analytics_indexes.ts
+├── tui-plugin.tsx             # Устанавливаемая TUI-панель (сайдбар)
+├── tui.jsonc                  # Пример конфига TUI-плагина
 ├── tests/
-│   ├── storage.test.ts         # Storage, миграции и batch-запись
-│   └── observer.test.ts        # Observer, LSP и todo-события
+│   ├── storage.test.ts         # Storage, миграции, batch и аналитика
+│   ├── observer.test.ts        # Observer, SDK-payload'ы и guardrails
+│   ├── path-match.test.ts      # Glob-контракты
+│   ├── import-graph.test.ts    # Индексатор импортов
+│   └── agent-tools.test.ts     # DoD и Change Contract gates
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── DATA_MODEL.md
+│   ├── FIX_PLAN.md
 │   ├── IMPLEMENTATION_PLAN.md
 │   ├── ROADMAP.md
 │   ├── TOOLS_API.md

@@ -6,6 +6,7 @@
 // =============================================================================
 
 import { tool } from "@opencode-ai/plugin"
+import * as path from "node:path"
 import type { StorageEngine } from "../storage"
 import type { ShadowConfig } from "../types"
 import {
@@ -26,9 +27,9 @@ import {
   RiskLevel,
   EdgeType,
   NodeType,
-  AgentType,
 } from "../types"
 import { createLogger } from "../logger"
+import { indexImports } from "../import-graph"
 
 // ---------------------------------------------------------------------------
 // Типы аргументов
@@ -40,6 +41,7 @@ type AnalyzerArgs = {
   timeframe?: string
   limit?: number
   depth?: number
+  project_root?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -121,23 +123,25 @@ async function handleHotspots(
 ): Promise<{ hotspots: HotspotEntry[]; generated_at: number; timeframe: string; total_files_analyzed: number }> {
   const limit = args.limit || 10
   const timeframe = args.timeframe || "30d"
+  const projectRoot = args.project_root || ""
 
-  // 1. Проверяем кеш аналитики
-  const cacheKey = `hotspots:${timeframe}:${limit}`
+  // 1. Проверяем кеш аналитики (project-scoped, иначе проекты смешиваются)
+  const cacheKey = `hotspots:${projectRoot}:${timeframe}:${limit}`
   const cached = storage.getCached(cacheKey)
   if (cached) {
     log.info(`Хотспоты взяты из кеша: key=${cacheKey}`)
     return cached as { hotspots: HotspotEntry[]; generated_at: number; timeframe: string; total_files_analyzed: number }
   }
 
-  // 2. Получаем все уникальные файлы за период
-  const files = storage.getDistinctFiles(timeframe)
-  if (files.length === 0) {
+  // 2. Собираем сырые метрики одной агрегатной выборкой (без N+1)
+  const metrics = storage.getHotspotMetrics(timeframe, projectRoot)
+  if (metrics.length === 0) {
     log.info("Нет данных о правках за указанный период")
     return { hotspots: [], generated_at: Date.now(), timeframe, total_files_analyzed: 0 }
   }
+  const errorCounts = storage.getErrorCountsByFile(timeframe, projectRoot)
+  const days = daysFromTimeframe(timeframe)
 
-  // 3. Собираем сырые метрики по каждому файлу
   interface RawMetrics {
     filePath: string
     totalEdits: number
@@ -148,28 +152,15 @@ async function handleHotspots(
     lastEditedAt: number | null
   }
 
-  const rawMetrics: RawMetrics[] = []
-  for (const filePath of files) {
-    const editCount = storage.getFileEditCount(filePath, timeframe)
-    if (editCount === 0) continue
-
-    const freq = storage.getEditFrequency(filePath, timeframe)
-    const errorCount = storage.getErrorCountForFile(filePath, timeframe)
-    const revertedCount = storage.getRevertedEditCount(filePath, timeframe)
-    const recentEditCount = storage.getFileEditCount(filePath, "7d")
-    const edits = storage.getFileEdits(filePath, timeframe)
-    const lastEditedAt = edits.length > 0 ? edits[0].timestamp : null
-
-    rawMetrics.push({
-      filePath,
-      totalEdits: editCount,
-      perDay: freq.perDay,
-      errorCount,
-      revertedCount,
-      recentEditCount,
-      lastEditedAt,
-    })
-  }
+  const rawMetrics: RawMetrics[] = metrics.map((metric) => ({
+    filePath: metric.filePath,
+    totalEdits: metric.edits,
+    perDay: safeDiv(metric.edits, days),
+    errorCount: errorCounts.get(metric.filePath) || 0,
+    revertedCount: metric.reverted,
+    recentEditCount: metric.recentEdits,
+    lastEditedAt: metric.lastAt || null,
+  }))
 
   if (rawMetrics.length === 0) {
     return { hotspots: [], generated_at: Date.now(), timeframe, total_files_analyzed: 0 }
@@ -262,24 +253,27 @@ async function handlePredictChange(
   const filePath = args.target
   if (!filePath) return { error: "Укажите target — путь к файлу для анализа" }
 
+  const projectRoot = args.project_root
+
   // 1. Количество зависимостей из графа знаний
-  const dependencyCount = storage.getDependencyCount(filePath)
+  const dependencyCount = storage.getDependencyCount(filePath, projectRoot)
 
   // 2. Историческая частота поломок
-  const breakageRate = storage.getHistoricalBreakageRate(filePath, "30d")
+  const breakageRate = storage.getHistoricalBreakageRate(filePath, "30d", projectRoot)
 
   // 3. Недавние похожие изменения
-  const recentSessions = storage.getRecentSimilarChanges(filePath, "30d", 5)
+  const recentSessions = storage.getRecentSimilarChanges(filePath, "30d", 5, projectRoot)
   const recentSimilarChanges = recentSessions.map((s) => ({
     file: filePath,
     date: formatDate(s.startedAt),
     result: s.errorsCount > 0 ? "errors" : "clean",
   }))
 
-  // 4. Вычисляем риск
-  const riskScore =
+  // 4. Вычисляем риск (всегда 0..1)
+  const riskScore = clamp01(
     breakageRate * 0.6 +
     Math.min(dependencyCount / 20, 1) * 0.4
+  )
 
   // 5. Определяем уровень риска
   let riskLevel: RiskLevel
@@ -288,11 +282,11 @@ async function handlePredictChange(
   else if (riskScore < 0.8) riskLevel = RiskLevel.High
   else riskLevel = RiskLevel.Critical
 
-  // 6. Файлы, которые могут быть затронуты
-  const coChanged = storage.getCoChangedFiles(filePath, 1)
+  // 6. Файлы, которые могут быть затронуты (ограниченная выборка)
+  const coChanged = storage.getCoChangedFiles(filePath, 1, projectRoot, 20)
   const affectedFiles = coChanged.map((cc) => {
     // Считаем вероятность поломки со-изменяемого файла
-    const coBreakRate = storage.getHistoricalBreakageRate(cc.file, "30d")
+    const coBreakRate = storage.getHistoricalBreakageRate(cc.file, "30d", projectRoot)
     const coFreq = cc.frequency
     const breakProbability = clamp01(coBreakRate * 0.7 + Math.min(coFreq / 20, 1) * 0.3)
     return {
@@ -351,10 +345,13 @@ async function handleFileHistory(
   if (!filePath) return { error: "Укажите target — путь к файлу" }
 
   const timeframe = args.timeframe || "all"
+  const projectRoot = args.project_root
+  const timeframeCutoff = timeframe === "all" ? null : Date.now() - daysFromTimeframe(timeframe) * 24 * 60 * 60 * 1000
 
-  // 1. Получаем все правки файла
-  const edits = storage.getFileEdits(filePath, timeframe)
-  if (edits.length === 0) {
+  // Timeline periods must be built from the full history; filtering the raw
+  // fetch by timeframe made 30d/90d/all buckets empty or truncated.
+  const allEdits = storage.getFileEdits(filePath, undefined, projectRoot)
+  if (allEdits.length === 0) {
     return {
       filePath,
       totalEdits: 0,
@@ -365,12 +362,13 @@ async function handleFileHistory(
     }
   }
 
-  // 2. Получаем ошибки файла для привязки к правкам
-  const errors = storage.getErrorsForFile(filePath, timeframe)
+  const allErrors = storage.getErrorsForFile(filePath, undefined, projectRoot)
+  const edits = timeframeCutoff === null ? allEdits : allEdits.filter((edit) => edit.timestamp >= timeframeCutoff)
+  const errors = timeframeCutoff === null ? allErrors : allErrors.filter((error) => error.timestamp >= timeframeCutoff)
 
   // Группируем ошибки по sessionId для быстрого поиска
   const errorsBySession = new Map<string, SessionError[]>()
-  for (const err of errors) {
+  for (const err of allErrors) {
     const list = errorsBySession.get(err.sessionId) || []
     list.push(err)
     errorsBySession.set(err.sessionId, list)
@@ -401,8 +399,8 @@ async function handleFileHistory(
 
   const timeline: FileHistoryTimeline[] = periods.map((p) => {
     const cutoff = now - p.cutoffDays * 24 * 60 * 60 * 1000
-    const filtered = edits.filter((e) => e.timestamp >= cutoff)
-    const errorCount = errors.filter((e) => e.timestamp >= cutoff).length
+    const filtered = allEdits.filter((e) => e.timestamp >= cutoff)
+    const errorCount = allErrors.filter((e) => e.timestamp >= cutoff).length
     const revertCount = filtered.filter((e) => e.wasReverted).length
 
     // Топ контрибьюторов по sessionId
@@ -468,38 +466,27 @@ async function handleTeamPulse(
   log: ReturnType<typeof createLogger>,
 ): Promise<TeamPulse> {
   const timeframe = args.timeframe || "30d"
+  const projectRoot = args.project_root
 
   // 1. Количество хотспотов (переиспользуем логику, но ограниченно)
   const hotspotResult = await handleHotspots(storage, { ...args, limit: 50 }, log)
   const hotspots = hotspotResult.hotspots
   const hotspotCount = hotspots.filter((h) => h.score > 60).length
 
-  // 2. Количество уникальных файлов
-  const allFiles = storage.getDistinctFiles(timeframe)
-  const totalFiles = allFiles.length
+  // 2. Полные агрегаты по проекту (без алфавитного среза файлов)
+  const totals = storage.getEditTotals(timeframe, projectRoot)
+  const allFiles = storage.getDistinctFiles(timeframe, projectRoot)
+  const totalFiles = totals.files
+  // "Активные" — файлы, которые редактировались за последние 7 дней.
+  const activeFiles = storage.getEditTotals("7d", projectRoot).files
 
-  // 3. Файлы, которые редактировались (активные)
-  const activeFiles = allFiles.length
+  // 3. Статистика сессий
+  const sessionCount = storage.getSessionCount(timeframe, projectRoot)
 
-  // 4. Статистика сессий
-  const sessionCount = storage.getSessionCount(timeframe)
-
-  // 5. AI reliance ratio: доля правок от AI-агентов
-  let totalEditsAll = 0
-  let aiEdits = 0
-  let totalErrors = 0
-  for (const file of allFiles.slice(0, 200)) {
-    // Ограничиваем 200 файлами для производительности
-    const edits = storage.getFileEdits(file, timeframe)
-    totalEditsAll += edits.length
-    aiEdits += edits.filter(
-      (e) => e.agentType === AgentType.Build || e.agentType === AgentType.Plan,
-    ).length
-    totalErrors += storage.getErrorCountForFile(file, timeframe)
-  }
-  const aiRelianceRatio = safeDiv(aiEdits, totalEditsAll)
-
-  // 6. Error rate
+  // 4. AI reliance ratio и error rate по всем правкам периода
+  const totalEditsAll = totals.edits
+  const aiRelianceRatio = safeDiv(totals.aiEdits, totalEditsAll)
+  const totalErrors = storage.getErrorTotalForEditedFiles(timeframe, projectRoot)
   const errorRate = safeDiv(totalErrors, totalEditsAll)
 
   // 7. Project health score: взвешенная композиция метрик
@@ -512,18 +499,13 @@ async function handleTeamPulse(
   const healthScore = clamp01(1 - (hotspotPenalty * 0.3 + errorPenalty * 0.5) + aiBonus)
 
   // 8. Определяем тренд: сравниваем с предыдущим периодом
-  let prevErrors = 0
-  let prevEdits = 0
+  let prevErrorRate = 0
   const bounds = periodBounds(timeframe)
   if (bounds) {
-    const prevFiles = storage.getDistinctFilesBetween(bounds.previousStart, bounds.previousEnd)
-    for (const file of prevFiles.slice(0, 200)) {
-      const edits = storage.getFileEditsBetween(file, bounds.previousStart, bounds.previousEnd)
-      prevEdits += edits.length
-      prevErrors += storage.getErrorsForFileBetween(file, bounds.previousStart, bounds.previousEnd).length
-    }
+    const prevTotals = storage.getEditTotalsBetween(bounds.previousStart, bounds.previousEnd, projectRoot)
+    const prevErrors = storage.getErrorTotalForEditedFilesBetween(bounds.previousStart, bounds.previousEnd, projectRoot)
+    prevErrorRate = safeDiv(prevErrors, prevTotals.edits)
   }
-  const prevErrorRate = safeDiv(prevErrors, prevEdits)
 
   let trend: "improving" | "stable" | "declining"
   if (prevErrorRate > 0 && errorRate < prevErrorRate * 0.8) trend = "improving"
@@ -549,44 +531,38 @@ async function handleTeamPulse(
     const nextMonth = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 1).getTime()
     const monthEnd = i === 0 ? now : nextMonth
 
-    let monthErrors = 0
-    let monthEdits = 0
-    for (const file of allFiles.slice(0, 100)) {
-      const monthFiltered = storage.getFileEditsBetween(file, monthCutoff, monthEnd)
-      monthEdits += monthFiltered.length
-      monthErrors += storage.getErrorsForFileBetween(file, monthCutoff, monthEnd).length
-    }
+    const monthEdits = storage.getEditTotalsBetween(monthCutoff, monthEnd, projectRoot).edits
+    const monthErrors = storage.getErrorTotalForEditedFilesBetween(monthCutoff, monthEnd, projectRoot)
     const monthErrorRate = safeDiv(monthErrors, monthEdits)
     const monthScore = clamp01(1 - monthErrorRate * 1.5)
     healthOverTime.push({ month: monthStr, score: Math.round(monthScore * 100) / 100 })
   }
 
-  // 11. Разбивка по модулям (директориям первого уровня)
-  const moduleMap = new Map<string, { files: number; healthScore: number; hotspot: string | null }>()
-  for (const file of allFiles) {
-    const parts = file.replace(/\\/g, "/").split("/")
+  // 11. Разбивка по модулям (директориям первого уровня) на реальных метриках
+  const moduleMap = new Map<string, { files: number; edits: number; errors: number; hotspot: string | null; hotspotErrors: number }>()
+  for (const metric of storage.getFileMetrics(timeframe, projectRoot)) {
+    const parts = metric.filePath.replace(/\\/g, "/").split("/")
     const module = parts.length > 1 ? parts.slice(0, 2).join("/") : parts[0] || "root"
 
-    const existing = moduleMap.get(module) || { files: 0, healthScore: 0, hotspot: null }
+    const existing = moduleMap.get(module) || { files: 0, edits: 0, errors: 0, hotspot: null, hotspotErrors: 0 }
     existing.files++
-    // Приблизительный health score для модуля на основе хотспотов
-    // Находим hotspot для этого модуля если есть
-    const modHotspot = hotspots.find((h) => h.filePath.startsWith(module))
-    if (modHotspot) {
-      existing.healthScore = clamp01(1 - modHotspot.score / 100)
-      if (!existing.hotspot) existing.hotspot = modHotspot.filePath
-    } else {
-      existing.healthScore = clamp01(existing.healthScore + 0.02)
+    existing.edits += metric.edits
+    existing.errors += metric.errors
+    if (metric.errors > 0 && metric.errors > existing.hotspotErrors) {
+      existing.hotspotErrors = metric.errors
+      existing.hotspot = metric.filePath
     }
     moduleMap.set(module, existing)
   }
 
-  const moduleBreakdown = [...moduleMap.entries()].map(([module, data]) => ({
-    module,
-    healthScore: Math.round(data.healthScore * 100) / 100,
-    files: data.files,
-    hotspot: data.hotspot,
-  }))
+  const moduleBreakdown = [...moduleMap.entries()]
+    .map(([module, data]) => ({
+      module,
+      healthScore: Math.round(clamp01(1 - safeDiv(data.errors, data.edits)) * 100) / 100,
+      files: data.files,
+      hotspot: data.hotspot,
+    }))
+    .sort((a, b) => a.module.localeCompare(b.module))
 
   log.info(
     `team_pulse: health=${healthScore.toFixed(2)}, trend=${trend}, files=${totalFiles}, hotspots=${hotspotCount}`,
@@ -619,14 +595,15 @@ async function handleMyStats(
   log: ReturnType<typeof createLogger>,
 ): Promise<DevStats> {
   const timeframe = args.timeframe || "30d"
+  const projectRoot = args.project_root
 
   // 1. Количество сессий в периоде
-  const sessionCount = storage.getSessionCount(timeframe)
+  const sessionCount = storage.getSessionCount(timeframe, projectRoot)
   const daysTotal = daysFromTimeframe(timeframe)
   const sessionsPerDay = safeDiv(sessionCount, daysTotal)
 
   // 2. Средняя длительность сессий (используем developer_events и sessions)
-  const devEvents = storage.getDevEvents(undefined, timeframe)
+  const devEvents = storage.getDevEvents(undefined, timeframe, 5000, projectRoot)
   const sessionStartEvents = devEvents.filter((e) => e.eventType === "session_start" || e.eventType === "session_started")
   const sessionEndEvents = devEvents.filter((e) => e.eventType === "session_end" || e.eventType === "session_completed")
 
@@ -644,64 +621,20 @@ async function handleMyStats(
   const avgSessionDurationMs =
     sessionDurations > 0 ? totalDuration / sessionDurations : sessionCount > 0 ? 15 * 60 * 1000 : 0
 
-  // 3. Топ файлов по количеству правок
-  const allFiles = storage.getDistinctFiles(timeframe)
-  const fileEditCounts: { path: string; edits: number }[] = []
-  for (const file of allFiles.slice(0, 100)) {
-    const count = storage.getFileEditCount(file, timeframe)
-    if (count > 0) fileEditCounts.push({ path: file, edits: count })
-  }
-  fileEditCounts.sort((a, b) => b.edits - a.edits)
-  const topFiles = fileEditCounts.slice(0, 10)
+  // 3. Топ файлов по количеству правок (полная выборка по БД)
+  const topFiles = storage.getTopFilesByEdits(timeframe, 10, projectRoot)
+    .map(({ filePath, edits }) => ({ path: filePath, edits }))
 
-  // 4. AI reliance ratio (доля правок AI vs все правки)
-  let totalEditsAll = 0
-  let aiEditCount = 0
-  for (const file of allFiles.slice(0, 200)) {
-    const edits = storage.getFileEdits(file, timeframe)
-    totalEditsAll += edits.length
-    aiEditCount += edits.filter(
-      (e) => e.agentType === AgentType.Build || e.agentType === AgentType.Plan,
-    ).length
-  }
-  const aiRelianceRatio = safeDiv(aiEditCount, totalEditsAll)
+  // 4. AI reliance ratio по всем правкам периода
+  const totals = storage.getEditTotals(timeframe, projectRoot)
+  const aiRelianceRatio = safeDiv(totals.aiEdits, totals.edits)
 
   // 5. Fix rate: доля правок, в которых человек исправлял AI-код
-  // (оцениваем через developer_events типа 'human_fix')
   const humanFixEvents = devEvents.filter((e) => e.eventType === "human_fix" || e.eventType === "manual_edit")
-  const fixRate = safeDiv(humanFixEvents.length, totalEditsAll)
+  const fixRate = safeDiv(humanFixEvents.length, totals.edits)
 
-  // 6. Распределение использования инструментов
-  // Получаем через tool_executions для всех сессий периода
-  const toolUsage: Record<string, number> = {}
-  // Для каждого файла собираем tool_executions
-  const toolFiles = new Map<string, number>()
-  for (const file of allFiles.slice(0, 200)) {
-    const execs = storage.getToolExecutionsForFile(file, timeframe)
-    for (const exec of execs) {
-      toolUsage[exec.toolName] = (toolUsage[exec.toolName] || 0) + 1
-    }
-  }
-
-  // 7. Тренды: сравниваем с предыдущим периодом
-  let prevTotalEdits = 0
-  let prevAiEdits = 0
-  const bounds = periodBounds(timeframe)
-  if (bounds) {
-    const prevFiles = storage.getDistinctFilesBetween(bounds.previousStart, bounds.previousEnd)
-    for (const file of prevFiles.slice(0, 200)) {
-      const edits = storage.getFileEditsBetween(file, bounds.previousStart, bounds.previousEnd)
-      prevTotalEdits += edits.length
-      prevAiEdits += edits.filter(
-        (e) => e.agentType === AgentType.Build || e.agentType === AgentType.Plan,
-      ).length
-    }
-  }
-  const prevAiReliance = safeDiv(prevAiEdits, prevTotalEdits)
-  const prevHumanFix = bounds
-    ? storage.getDevEventsBetween("human_fix", bounds.previousStart, bounds.previousEnd).length
-    : 0
-  const prevFixRate = safeDiv(prevHumanFix, prevTotalEdits)
+  // 6. Распределение использования инструментов по всем вызовам периода
+  const toolUsage = storage.getToolUsageCounts(timeframe, projectRoot)
 
   log.info(
     `my_stats: sessions=${sessionCount}, sessions/day=${sessionsPerDay.toFixed(1)}, ai=${aiRelianceRatio.toFixed(2)}`,
@@ -731,14 +664,36 @@ async function handleDependencyGraph(
   const filePath = args.target
   if (!filePath) return { error: "Укажите target — путь к файлу" }
   const depth = Math.max(1, Math.min(args.depth || 1, 5))
+  const projectRoot = args.project_root || process.cwd()
+  const indexedFiles = new Set<string>()
+  const tryIndex = (candidate: string | null): void => {
+    if (!candidate || indexedFiles.size >= 40) return
+    const absolute = path.isAbsolute(candidate) ? candidate : path.resolve(projectRoot, candidate)
+    if (indexedFiles.has(absolute)) return
+    indexedFiles.add(absolute)
+    indexImports(storage, projectRoot, candidate)
+  }
+  tryIndex(filePath)
 
   // 1. Ищем узел файла в knowledge_nodes
-  const nodes = storage.searchNodes(filePath, 100)
-  const fileNode = nodes.find((n) => n.nodeType === NodeType.File && n.path === filePath)
+  // Indexed paths are project-relative; normalize an absolute target too.
+  const searchPath = path.isAbsolute(filePath)
+    ? path.relative(projectRoot, filePath).replace(/\\/g, "/")
+    : filePath
+  const nodes = storage.searchNodes(searchPath, 100, projectRoot)
+  const fileNode = nodes.find((n) => n.nodeType === NodeType.File && n.path === searchPath)
 
   // 2. Получаем рёбра графа знаний
   const edges: { source: string; target: string; relation: EdgeType; weight: number }[] = []
   const nodeIds = new Set<string>()
+  const nodeTypes = new Map<string, "file" | "module" | "concept">()
+  const nodeLabels = new Map<string, string>()
+  const nodeCache = new Map<number, KnowledgeNode | undefined>()
+  const metricsByFile = new Map(storage.getFileMetrics("30d", projectRoot).map((metric) => [metric.filePath, metric]))
+  const getNodeCached = (nodeId: number): KnowledgeNode | undefined => {
+    if (!nodeCache.has(nodeId)) nodeCache.set(nodeId, storage.getNode(nodeId))
+    return nodeCache.get(nodeId)
+  }
 
   // Обходим граф breadth-first до указанной глубины.
   if (fileNode) {
@@ -747,14 +702,27 @@ async function handleDependencyGraph(
     let frontier = [fileNode.id]
 
     const nodeKey = (nodeId: number): string => {
-      const node = storage.getNode(nodeId)
-      return node?.path ?? `node:${nodeId}`
+      const node = getNodeCached(nodeId)
+      const key = node?.path ?? `node:${nodeId}`
+      if (node) {
+        nodeTypes.set(
+          key,
+          node.nodeType === NodeType.Module ? "module" : node.nodeType === NodeType.File ? "file" : "concept",
+        )
+        nodeLabels.set(key, node.name)
+      }
+      return key
     }
 
     nodeIds.add(nodeKey(fileNode.id))
     for (let level = 0; level < depth && frontier.length > 0; level++) {
       const next: number[] = []
       for (const nodeId of frontier) {
+        // Index imports lazily so depth traversal follows real code edges.
+        const currentNode = getNodeCached(nodeId)
+        if (currentNode?.nodeType === NodeType.File && currentNode.path) {
+          tryIndex(currentNode.path)
+        }
         for (const edge of storage.getEdgesForNode(nodeId)) {
           const key = `${edge.id}:${edge.sourceId}:${edge.targetId}`
           if (edgeKeys.has(key)) continue
@@ -778,11 +746,11 @@ async function handleDependencyGraph(
   }
 
   // 3. Со-изменяемые файлы (co-changed)
-  const coChanged = storage.getCoChangedFiles(filePath, 1)
+  const coChanged = storage.getCoChangedFiles(searchPath, 1, projectRoot, 20)
   for (const cc of coChanged) {
     const weight = Math.min(cc.frequency / 10, 1)
     edges.push({
-      source: filePath,
+      source: searchPath,
       target: cc.file,
       relation: EdgeType.CoupledWith,
       weight: Math.round(weight * 100) / 100,
@@ -790,22 +758,21 @@ async function handleDependencyGraph(
     nodeIds.add(cc.file)
   }
   // Добавляем сам файл
-  nodeIds.add(filePath)
+  nodeIds.add(searchPath)
 
   // 4. Строим узлы
   const graphNodes = [...nodeIds].map((id) => {
     const hotspot = (() => {
-      // Быстрая оценка hotspot score через частоту правок
-      const freq = storage.getEditFrequency(id, "30d")
-      const errCount = storage.getErrorCountForFile(id, "30d")
-      if (freq.total === 0) return undefined
-      const rawScore = clamp01(Math.min(freq.perDay / 5, 1) * 0.5 + safeDiv(errCount, freq.total) * 0.5)
+      // Быстрая оценка hotspot score из одной агрегатной выборки
+      const metric = metricsByFile.get(id)
+      if (!metric || metric.edits === 0) return undefined
+      const rawScore = clamp01(Math.min((metric.edits / 30) / 5, 1) * 0.5 + safeDiv(metric.errors, metric.edits) * 0.5)
       return Math.round(rawScore * 100)
     })()
     return {
       id,
-      label: id.split("/").pop() || id,
-      type: "file" as const,
+      label: nodeLabels.get(id) || id.split(/[\\/]/).pop() || id,
+      type: nodeTypes.get(id) ?? (id.startsWith("node:") ? "concept" : "file"),
       hotspotScore: hotspot,
     }
   })
@@ -845,7 +812,7 @@ async function handleCodeErrors(
 ): Promise<{ result: string; items: Array<Record<string, unknown>>; suggestion?: string }> {
   const timeframe = args.timeframe || "7d"
   const limit = args.limit || 20
-  const projectRoot = args.target || ""
+  const projectRoot = args.target || args.project_root || ""
 
   const cutoff = (() => {
     const match = timeframe.match(/^(\d+)d$/)
@@ -929,8 +896,10 @@ async function handleKnowledgeSearch(
 
   const results: KnowledgeSearchResult[] = []
 
+  const projectRoot = args.project_root
+
   // 1. Поиск по knowledge_nodes
-  const nodes = storage.searchNodes(query, limit)
+  const nodes = storage.searchNodes(query, limit, projectRoot)
   for (const node of nodes) {
     const meta = node.metadata as Record<string, unknown> | null
     // Точное совпадение > частичное > по тегам
@@ -961,7 +930,7 @@ async function handleKnowledgeSearch(
   }
 
   // 2. Поиск по decisions
-  const decisions = storage.getDecisions(undefined, 100)
+  const decisions = storage.getDecisions(undefined, 100, projectRoot)
   for (const d of decisions) {
     const titleLower = d.title.toLowerCase()
     const descLower = d.description.toLowerCase()
@@ -1018,8 +987,9 @@ async function handleDecisionsList(
 ): Promise<Decision[]> {
   const status = args.target // используем target как фильтр статуса
   const limit = args.limit || 20
+  const projectRoot = args.project_root
 
-  const decisions = storage.getDecisions(status, limit)
+  const decisions = storage.getDecisions(status, limit, projectRoot)
 
   log.info(
     `decisions_list: status=${status ?? "all"}, found=${decisions.length}`,
@@ -1060,15 +1030,25 @@ export function createAnalyzeTool(
         timeframe: tool.schema.enum(["7d", "30d", "90d", "all"]).optional(),
         limit: tool.schema.number().optional(),
         depth: tool.schema.number().optional(),
+        project_root: tool.schema.string().optional(),
       },
 
       async execute(args, context) {
+        const session = context.sessionID ? storage.getSession(context.sessionID) : undefined
+        const resolvedProjectRoot =
+          (args.project_root as string | undefined) ||
+          session?.projectRoot ||
+          ((context as Record<string, unknown>).directory as string | undefined) ||
+          ((context as Record<string, unknown>).cwd as string | undefined) ||
+          process.cwd()
+
         const analyzerArgs: AnalyzerArgs = {
           query: args.query as string,
           target: args.target as string | undefined,
           timeframe: args.timeframe as string | undefined,
           limit: args.limit as number | undefined,
           depth: args.depth as number | undefined,
+          project_root: resolvedProjectRoot,
         }
 
         toolLog.info(

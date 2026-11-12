@@ -59,6 +59,20 @@ async function ensureTuiPlugin(pluginDir: string, log: ReturnType<typeof createL
       const tuiConfig = { plugin: ["./plugins/code-shadow/tui-plugin.tsx"] }
       fs.writeFileSync(tuiConfigPath, JSON.stringify(tuiConfig, null, 2) + "\n", "utf-8")
       log.info("tui.json создан — перезапустите OpenCode для активации сайдбара")
+    } else {
+      // Merge instead of assuming the user's tui.json is empty.
+      const entry = "./plugins/code-shadow/tui-plugin.tsx"
+      try {
+        const parsed = JSON.parse(fs.readFileSync(tuiConfigPath, "utf-8")) as { plugin?: unknown }
+        const plugins = Array.isArray(parsed.plugin) ? parsed.plugin : []
+        if (!plugins.includes(entry)) {
+          parsed.plugin = [...plugins, entry]
+          fs.writeFileSync(tuiConfigPath, JSON.stringify(parsed, null, 2) + "\n", "utf-8")
+          log.info("TUI-плагин добавлен в существующий tui.json")
+        }
+      } catch (configError) {
+        log.warn(`tui.json не изменён (невалидный JSON): ${String(configError)}`)
+      }
     }
   } catch (err) {
     log.error(`Ошибка авто-установки TUI: ${String(err)}`)
@@ -301,6 +315,15 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
     }
   }, config.flushIntervalMs)
 
+  // Retention должен работать в долгоживущем процессе, а не только на старте.
+  const cleanupInterval = setInterval(() => {
+    try {
+      storage.runCleanup(config.retentionDays, config.sessionRetentionDays)
+    } catch (err) {
+      log.error(`Ошибка периодической очистки: ${String(err)}`)
+    }
+  }, 6 * 60 * 60 * 1000)
+
   // CRUSH.md refresh — проверяем каждые 10 секунд, обновляем только если данные изменились
   let crushChecksSinceRefresh = 0
   const crushInterval = setInterval(async () => {
@@ -370,7 +393,7 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
 
   let tuiHooks: Record<string, unknown> = {}
   try {
-    tuiHooks = createTuiIntegration(storage, config, log) as unknown as Record<string, unknown>
+    tuiHooks = createTuiIntegration(storage, config, log, ctx.client) as unknown as Record<string, unknown>
     log.info("TUI-интеграция активирована")
   } catch (err) {
     log.error(`Ошибка создания TUI-интеграции: ${String(err)}`)
@@ -387,6 +410,7 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
     log.info("Code Shadow завершает работу...")
     clearInterval(flushInterval)
     clearInterval(crushInterval)
+    clearInterval(cleanupInterval)
     try {
       storage.flushBatch()
       storage.close()
@@ -394,6 +418,9 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
     } catch (err) {
       log.error(`Ошибка при завершении: ${String(err)}`)
     }
+    process.off("exit", cleanup)
+    process.off("SIGINT", cleanup)
+    process.off("SIGTERM", cleanup)
   }
 
   process.on("exit", cleanup)
@@ -411,23 +438,29 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
     ...tuiHooks,
   }
 
-  const observerBefore = observerHooks["tool.execute.before"] as
-    | ((input: unknown, output: unknown) => Promise<void>)
-    | undefined
-  const tuiBefore = tuiHooks["tool.execute.before"] as
-    | ((input: unknown, output: unknown) => Promise<void>)
-    | undefined
+  const mergeSequential = (hookName: string) => {
+    const observerHook = observerHooks[hookName] as
+      | ((input: unknown, output: unknown) => Promise<void>)
+      | undefined
+    const tuiHook = tuiHooks[hookName] as
+      | ((input: unknown, output: unknown) => Promise<void>)
+      | undefined
 
-  if (observerBefore && tuiBefore) {
-    mergedHooks["tool.execute.before"] = async (input: unknown, output: unknown) => {
-      await observerBefore(input, output)
-      await tuiBefore(input, output)
+    if (observerHook && tuiHook) {
+      mergedHooks[hookName] = async (input: unknown, output: unknown) => {
+        await observerHook(input, output)
+        await tuiHook(input, output)
+      }
     }
   }
+
+  mergeSequential("tool.execute.before")
+  mergeSequential("event")
 
   return {
     ...mergedHooks,
     tool: allTools as Record<string, unknown>,
+    dispose: async () => cleanup(),
   } as any
 }
 

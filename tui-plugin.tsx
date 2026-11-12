@@ -59,7 +59,7 @@ function closeDb(): void {
   }
 }
 
-function scalar(sql: string, ...params: unknown[]): number {
+function scalar(sql: string, ...params: any[]): number {
   const d = getDb()
   if (!d) return 0
   try {
@@ -72,7 +72,7 @@ function scalar(sql: string, ...params: unknown[]): number {
   }
 }
 
-function query<T extends Record<string, unknown>>(sql: string, ...params: unknown[]): T[] {
+function query<T extends Record<string, unknown>>(sql: string, ...params: any[]): T[] {
   const d = getDb()
   if (!d) return []
   try {
@@ -139,7 +139,7 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
   return {
     order: 700,
     slots: {
-      sidebar_content(ctx, value) {
+      sidebar_content(ctx: any, value: any) {
         const s = theme(ctx)
 
         // ----- State -----
@@ -220,9 +220,10 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
             root,
           ))
 
-          // Memory (global — not per project)
+          // Memory (per project; legacy global nodes without project_root are kept)
           setMemCnt(scalar(
-            "SELECT COUNT(*) FROM knowledge_nodes WHERE node_type IN ('concept','pattern','rule')",
+            "SELECT COUNT(*) FROM knowledge_nodes WHERE node_type IN ('concept','pattern','rule') AND (project_root = ?1 OR project_root IS NULL)",
+            root,
           ))
 
           // Agent-native state: the TUI shows whether the agent is reasoning
@@ -242,9 +243,10 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
           const hsWithErrs: { file: string; edits: number; errors: number }[] = []
           for (const hr of hsRows) {
             const er = scalar(
-              "SELECT COUNT(*) FROM session_errors WHERE context_file = ?1 AND timestamp >= ?2",
+              "SELECT COUNT(*) FROM session_errors e INNER JOIN sessions s ON e.session_id = s.id WHERE e.context_file = ?1 AND e.timestamp >= ?2 AND s.project_root = ?3",
               hr.fp,
               cutoff30d,
+              root,
             )
             hsWithErrs.push({ file: hr.fp, edits: hr.ec, errors: er })
           }
@@ -394,7 +396,7 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
               <MetricItemSimple s={s} label="Tools" value={toolsCnt()} />
               <MetricItemSimple s={s} label="Memory" value={memCnt()} />
               <MetricItemSimple s={s} label="Hotspots" value={hotspots().length} />
-              <MetricItemSimple s={s} label="ADRs" value={scalar("SELECT COUNT(*) FROM decisions")} />
+              <MetricItemSimple s={s} label="ADRs" value={scalar("SELECT COUNT(*) FROM decisions WHERE project_root = ?1 OR project_root IS NULL", projectRoot ?? "")} />
             </box>
             <box flexDirection="row" justifyContent="space-between" padding={[0, 0]}>
               <MetricItemSimple s={s} label="Tasks" value={agentTasks()} />
@@ -455,7 +457,7 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
 
             {/* ─── INFO LINE ─── */}
             <box flexDirection="row" justifyContent="space-between" padding={[0, 0]}>
-              <text fg={s.muted}>v0.5.2 · {proj()}</text>
+              <text fg={s.muted}>v0.5.3 · {proj()}</text>
             </box>
 
             <text fg={s.border}>{DIVIDER}</text>
