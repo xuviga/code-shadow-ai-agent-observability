@@ -10,6 +10,7 @@
 import type { ShadowConfig } from "./types"
 import { NodeType } from "./types"
 import { sanitizeContent } from "./config"
+import { pathMatches } from "./path-match"
 import type { createLogger } from "./logger"
 import * as path from "node:path"
 
@@ -38,6 +39,7 @@ interface StorageEngineLike {
 
   // Batch
   enqueue(table: string, row: Record<string, unknown>): void
+  flushBatch(): void
 
   // Raw DB access
   getDb(): any
@@ -50,6 +52,7 @@ interface StorageEngineLike {
     metadata: Record<string, unknown> | null
     updatedAt: number
     createdAt?: number
+    projectRoot?: string | null
   }): number
 
   // Agent-native operating layer
@@ -66,7 +69,7 @@ interface StorageEngineLike {
 
 interface ObserverHooks {
   event: (input: { event: { type: string; properties: Record<string, unknown> } }) => Promise<void>
-  "chat.message": (input: { sessionID: string; messageID?: string }, output: { parts: Array<Record<string, unknown>> }) => Promise<void>
+  "chat.message": (input: { sessionID: string; messageID?: string; agent?: string }, output: { parts: Array<Record<string, unknown>> }) => Promise<void>
   "permission.ask": (input: { id: string; type: string; pattern?: string | string[]; sessionID: string; messageID: string; callID?: string; title: string; metadata: Record<string, unknown> }, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
   "file.edited": (input: { file?: string; filePath?: string; path?: string; type?: string; editType?: string; diff?: string; content?: string; linesAdded?: number; additions?: number; linesRemoved?: number; deletions?: number; sessionID?: string; sessionId?: string; agentType?: string; agent?: string; projectRoot?: string; cwd?: string }, output: any) => Promise<void>
   "tool.execute.before": (input: { tool: string; sessionID: string; callID: string }, output: { args: Record<string, unknown> }) => Promise<void>
@@ -80,11 +83,8 @@ interface ObserverHooks {
 // Модульные переменные
 // ---------------------------------------------------------------------------
 
-/** Отслеживание времени старта инструментов: ключ = `${sessionId}:${callId}` */
-const toolStartTimes = new Map<string, number>()
-
 /** Same failing tool signature repeated in one session. */
-const toolLoopMap = new Map<string, { count: number; lastStatus: string }>()
+type ToolLoopState = { count: number; lastStatus: string; lastAt: number }
 
 /**
  * Successful write/edit operations repeated for one file in one session.
@@ -103,11 +103,11 @@ type SuccessfulEditLoopState = {
   blocked: boolean
 }
 
-const successfulEditLoopMap = new Map<string, SuccessfulEditLoopState>()
 const SUCCESSFUL_EDIT_LOOP_WINDOW_MS = 10 * 60 * 1000
 const SUCCESSFUL_EDIT_LOOP_WARNING_COUNT = 3
 const SUCCESSFUL_EDIT_LOOP_REPEAT_BLOCK_COUNT = 3
 const SUCCESSFUL_EDIT_LOOP_NO_PROGRESS_BLOCK_COUNT = 5
+const TOOL_LOOP_WINDOW_MS = 10 * 60 * 1000
 
 class SuccessfulEditLoopGuardError extends Error {
   constructor(filePath: string, count: number) {
@@ -120,14 +120,15 @@ class SuccessfulEditLoopGuardError extends Error {
 const autoMemCache = new Map<string, number>()
 const AUTO_MEM_DEDUP_MS = 5 * 60 * 1000 // 5 минут
 
-/** Отслеживание файлов, отредактированных в каждой сессии (для авто-саммари) */
-const sessionFilesMap = new Map<string, Set<string>>()
+const MAX_TRACKED_KEYS = 5000
+const FILE_EDIT_DEDUP_MS = 1500
+const AGENT_EDIT_SETTLE_MS = 2000
+const HUMAN_FIX_WINDOW_MS = 10 * 60 * 1000
 
-/** ID текущей активной сессии — обновляется из session.created / tool.execute */
-let currentSessionId = ""
-
-/** Флаг для немедленного обновления CRUSH.md при изменении данных */
-let crushDirty = false
+function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+  if (map.size >= MAX_TRACKED_KEYS) map.clear()
+  map.set(key, value)
+}
 
 /** Маппинг категорий на nodeType */
 const CATEGORY_TO_NODE_TYPE: Record<string, string> = {
@@ -160,13 +161,53 @@ function normalizeTrackedPath(filePath: string): string {
 }
 
 function isMutatingFileTool(toolName: string): boolean {
-  return /^(write|edit)$/i.test(toolName)
+  return /^(write|edit|patch|apply_patch|multi_edit|multiedit)$/i.test(toolName)
+}
+
+const DIRECT_PATH_KEYS = [
+  "filePath",
+  "file_path",
+  "filepath",
+  "file",
+  "path",
+  "target_file",
+  "target",
+] as const
+
+/**
+ * Извлекает файлы, которые может изменить mutating-tool. Для patch/apply_patch
+ * дополнительно парсит заголовки unified diff и Codex-style patch.
+ */
+function extractMutatingTargets(args: Record<string, unknown>): string[] {
+  const targets = new Set<string>()
+  for (const key of DIRECT_PATH_KEYS) {
+    const value = args[key]
+    if (typeof value === "string" && value.trim()) targets.add(value.trim())
+  }
+  if (Array.isArray(args.files)) {
+    for (const value of args.files) {
+      if (typeof value === "string" && value.trim()) targets.add(value.trim())
+    }
+  }
+  const patchText = [args.patchText, args.patch, args.diff]
+    .find((value) => typeof value === "string" && value.length > 0) as string | undefined
+  if (patchText) {
+    for (const match of patchText.matchAll(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/gm)) {
+      targets.add(match[1].trim())
+    }
+    for (const match of patchText.matchAll(/^\+\+\+ [ab]\/(.+)$/gm)) {
+      const file = match[1].trim()
+      if (file !== "/dev/null") targets.add(file)
+    }
+  }
+  return [...targets]
 }
 
 function getEditFingerprint(toolName: string, args: Record<string, unknown>): string | null {
-  const content = toolName.toLowerCase() === "write"
+  const normalized = toolName.toLowerCase()
+  const content = normalized === "write"
     ? args.content
-    : args.newString ?? args.content ?? args.diff
+    : args.newString ?? args.content ?? args.diff ?? args.patchText ?? args.patch
   return typeof content === "string" && content.length > 0 ? hashContent(content) : null
 }
 
@@ -263,6 +304,17 @@ function normalizeEditType(value: unknown): string {
   return VALID_EDIT_TYPES.has(candidate) ? candidate : "update"
 }
 
+type LspSeverity = "error" | "warning" | "information" | "hint"
+
+function normalizeLspSeverity(value: unknown): LspSeverity {
+  const raw = String(value ?? "").toLowerCase()
+  if (raw === "1" || raw === "error") return "error"
+  if (raw === "2" || raw === "warning") return "warning"
+  if (raw === "3" || raw === "information" || raw === "info") return "information"
+  if (raw === "4" || raw === "hint") return "hint"
+  return "error"
+}
+
 // ---------------------------------------------------------------------------
 // Auto-Memory: дедупликация и сохранение
 // ---------------------------------------------------------------------------
@@ -279,8 +331,9 @@ async function autoSaveFact(
   category: string,
   content: string,
   log: ReturnType<typeof createLogger>,
+  projectRoot?: string,
 ): Promise<void> {
-  const key = `${category}:${content.substring(0, 50)}`
+  const key = `${projectRoot || ""}:${category}:${content.substring(0, 50)}`
   if (!shouldAutoSave(key)) return
 
   try {
@@ -289,6 +342,7 @@ async function autoSaveFact(
       nodeType,
       name: content.substring(0, 60),
       path: null,
+      projectRoot: projectRoot || undefined,
       metadata: {
         category,
         content,
@@ -311,229 +365,234 @@ async function autoDetectFromFile(
   storage: StorageEngineLike,
   filePath: string,
   log: ReturnType<typeof createLogger>,
+  projectRoot?: string,
 ): Promise<void> {
+  const saveFact = (category: string, content: string, _log?: unknown) =>
+    autoSaveFact(storage, category, content, log, projectRoot)
+
+  filePath = filePath.replace(/\\/g, "/")
+
   try {
     // Не обрабатываем файлы из системных директорий
-    if (filePath.match(/node_modules|\.git|dist|build|\.next|\.cache|__pycache__|vendor|\.venv|venv/)) return
+    if (/(^|\/)(node_modules|\.git|dist|build|\.next|\.cache|__pycache__|vendor|\.venv|venv)(\/|$)/.test(filePath)) return
 
     // --- Конфигурационные файлы ---
 
     // package.json
     if (filePath.endsWith("package.json") || filePath.endsWith("package.jsonc")) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Node.js / npm", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Node.js / npm", log)
     }
 
     // tsconfig.json
     if (filePath.endsWith("tsconfig.json")) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует TypeScript (tsconfig.json)", log)
+      await saveFact("CONFIG_VALUES", "Проект использует TypeScript (tsconfig.json)", log)
     }
 
     // AGENTS.md / CONTEXT.md / README.md / CLAUDE.md
     if (filePath.endsWith("AGENTS.md") || filePath.endsWith("CONTEXT.md") || filePath.endsWith("CLAUDE.md")) {
-      await autoSaveFact(storage, "PROJECT_RULES", `Проект имеет файл конвенций: ${filePath.split("/").pop() || filePath}`, log)
+      await saveFact("PROJECT_RULES", `Проект имеет файл конвенций: ${filePath.split("/").pop() || filePath}`, log)
     }
 
     // --- Языки и фреймворки по расширениям ---
 
     if (filePath.match(/\.tsx?$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует TypeScript", log)
+      await saveFact("CONFIG_VALUES", "Проект использует TypeScript", log)
     }
     if (filePath.match(/\.vue$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Vue", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Vue", log)
     }
     if (filePath.match(/\.svelte$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Svelte", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Svelte", log)
     }
     if (filePath.match(/\.jsx$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует React (JSX)", log)
+      await saveFact("CONFIG_VALUES", "Проект использует React (JSX)", log)
     }
     if (filePath.match(/\.py$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Python", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Python", log)
     }
     if (filePath.match(/\.rs$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Rust", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Rust", log)
     }
     if (filePath.match(/\.go$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Go", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Go", log)
     }
     if (filePath.match(/\.java$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Java", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Java", log)
     }
     if (filePath.match(/\.cs$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует C#", log)
+      await saveFact("CONFIG_VALUES", "Проект использует C#", log)
     }
     if (filePath.match(/\.swift$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Swift", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Swift", log)
     }
     if (filePath.match(/\.dart$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Dart", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Dart", log)
     }
 
     // --- CSS-фреймворки и инструменты ---
 
     if (filePath.match(/tailwind\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Tailwind CSS", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Tailwind CSS", log)
     }
     if (filePath.match(/postcss\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует PostCSS", log)
+      await saveFact("CONFIG_VALUES", "Проект использует PostCSS", log)
     }
     if (filePath.match(/\.scss$/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует SCSS/Sass", log)
+      await saveFact("CONFIG_VALUES", "Проект использует SCSS/Sass", log)
     }
 
     // --- Инфраструктура ---
 
     if (filePath.match(/Dockerfile/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует Docker", log)
+      await saveFact("ARCHITECTURE", "Проект использует Docker", log)
     }
     if (filePath.match(/docker-compose/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует Docker Compose", log)
+      await saveFact("ARCHITECTURE", "Проект использует Docker Compose", log)
     }
     if (filePath.match(/\.github\/workflows/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует GitHub Actions для CI/CD", log)
+      await saveFact("ARCHITECTURE", "Проект использует GitHub Actions для CI/CD", log)
     }
     if (filePath.match(/\.gitlab-ci\.yml/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует GitLab CI/CD", log)
+      await saveFact("ARCHITECTURE", "Проект использует GitLab CI/CD", log)
     }
     if (filePath.match(/Jenkinsfile/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует Jenkins", log)
+      await saveFact("ARCHITECTURE", "Проект использует Jenkins", log)
     }
     if (filePath.match(/\.circleci\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует CircleCI", log)
+      await saveFact("ARCHITECTURE", "Проект использует CircleCI", log)
     }
 
     // --- Базы данных и ORM ---
 
     if (filePath.match(/prisma/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Prisma ORM", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Prisma ORM", log)
     }
     if (filePath.match(/drizzle/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Drizzle ORM", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Drizzle ORM", log)
     }
     if (filePath.match(/knex/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Knex.js", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Knex.js", log)
     }
     if (filePath.match(/typeorm/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует TypeORM", log)
+      await saveFact("CONFIG_VALUES", "Проект использует TypeORM", log)
     }
     if (filePath.match(/mongoose/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Mongoose (MongoDB)", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Mongoose (MongoDB)", log)
     }
 
     // --- Структура проекта ---
 
-    if (filePath.match(/^src\/components\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Компоненты находятся в src/components/", log)
+    if (filePath.match(/(^|\/)src\/components\//)) {
+      await saveFact("ARCHITECTURE", "Компоненты находятся в src/components/", log)
     }
-    if (filePath.match(/^src\/utils\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Утилиты находятся в src/utils/", log)
+    if (filePath.match(/(^|\/)src\/utils\//)) {
+      await saveFact("ARCHITECTURE", "Утилиты находятся в src/utils/", log)
     }
-    if (filePath.match(/^src\/hooks\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "React-хуки находятся в src/hooks/", log)
+    if (filePath.match(/(^|\/)src\/hooks\//)) {
+      await saveFact("ARCHITECTURE", "React-хуки находятся в src/hooks/", log)
     }
-    if (filePath.match(/^src\/pages\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Страницы находятся в src/pages/", log)
+    if (filePath.match(/(^|\/)src\/pages\//)) {
+      await saveFact("ARCHITECTURE", "Страницы находятся в src/pages/", log)
     }
-    if (filePath.match(/^src\/lib\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Библиотечный код находится в src/lib/", log)
+    if (filePath.match(/(^|\/)src\/lib\//)) {
+      await saveFact("ARCHITECTURE", "Библиотечный код находится в src/lib/", log)
     }
-    if (filePath.match(/^src\/services\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Сервисы находятся в src/services/", log)
+    if (filePath.match(/(^|\/)src\/services\//)) {
+      await saveFact("ARCHITECTURE", "Сервисы находятся в src/services/", log)
     }
-    if (filePath.match(/^src\/app\//)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Next.js App Router используется (src/app/)", log)
+    if (filePath.match(/(^|\/)src\/app\//)) {
+      await saveFact("ARCHITECTURE", "Next.js App Router используется (src/app/)", log)
     }
 
     // --- Конвенции тестирования ---
 
-    if (filePath.match(/^tests?\//) || filePath.match(/\.test\./)) {
-      await autoSaveFact(storage, "NAMING", "Тесты используют .test. в имени файла", log)
+    if (filePath.match(/(^|\/)tests?\//) || filePath.match(/\.test\./)) {
+      await saveFact("NAMING", "Тесты используют .test. в имени файла", log)
     }
     if (filePath.match(/\.spec\./)) {
-      await autoSaveFact(storage, "NAMING", "Тесты используют .spec. в имени файла", log)
+      await saveFact("NAMING", "Тесты используют .spec. в имени файла", log)
     }
     if (filePath.match(/__tests__\//)) {
-      await autoSaveFact(storage, "NAMING", "Тесты находятся в директориях __tests__/", log)
+      await saveFact("NAMING", "Тесты находятся в директориях __tests__/", log)
     }
     if (filePath.match(/vitest\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Vitest для тестирования", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Vitest для тестирования", log)
     }
     if (filePath.match(/jest\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Jest для тестирования", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Jest для тестирования", log)
     }
     if (filePath.match(/playwright\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Playwright для e2e-тестов", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Playwright для e2e-тестов", log)
     }
     if (filePath.match(/cypress\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Cypress для e2e-тестов", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Cypress для e2e-тестов", log)
     }
 
     // --- Сборщики и бандлеры ---
 
     if (filePath.match(/webpack\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Webpack", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Webpack", log)
     }
     if (filePath.match(/vite\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Vite", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Vite", log)
     }
     if (filePath.match(/esbuild\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует esbuild", log)
+      await saveFact("CONFIG_VALUES", "Проект использует esbuild", log)
     }
     if (filePath.match(/rollup\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Rollup", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Rollup", log)
     }
 
     // --- Линтеры и форматтеры ---
 
     if (filePath.match(/eslint\.config|\.eslintrc/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует ESLint", log)
+      await saveFact("CONFIG_VALUES", "Проект использует ESLint", log)
     }
     if (filePath.match(/prettier\.config|\.prettierrc/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Prettier", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Prettier", log)
     }
     if (filePath.match(/biome\.json/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Biome", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Biome", log)
     }
 
     // --- Пакетные менеджеры ---
 
     if (filePath.endsWith("pnpm-lock.yaml") || filePath.match(/pnpm-workspace\.yaml/) || filePath.match(/\.npmrc/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует pnpm", log)
+      await saveFact("CONFIG_VALUES", "Проект использует pnpm", log)
     }
     if (filePath.endsWith("yarn.lock")) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Yarn", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Yarn", log)
     }
     if (filePath.endsWith("bun.lockb") || filePath.endsWith("bun.lock")) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Bun", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Bun", log)
     }
 
     // --- Фреймворки по конфигурационным файлам ---
 
     if (filePath.match(/next\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Next.js", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Next.js", log)
     }
     if (filePath.match(/nuxt\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Nuxt", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Nuxt", log)
     }
     if (filePath.match(/svelte\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует SvelteKit", log)
+      await saveFact("CONFIG_VALUES", "Проект использует SvelteKit", log)
     }
     if (filePath.match(/remix\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Remix", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Remix", log)
     }
     if (filePath.match(/astro\.config/)) {
-      await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Astro", log)
+      await saveFact("CONFIG_VALUES", "Проект использует Astro", log)
     }
 
     // --- CI/CD и окружение ---
 
     if (filePath.match(/\.env\.example/) || filePath.match(/\.env\.template/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект имеет шаблон переменных окружения", log)
+      await saveFact("ARCHITECTURE", "Проект имеет шаблон переменных окружения", log)
     }
     if (filePath.match(/Makefile/)) {
-      await autoSaveFact(storage, "ARCHITECTURE", "Проект использует Makefile для автоматизации", log)
+      await saveFact("ARCHITECTURE", "Проект использует Makefile для автоматизации", log)
     }
-    crushDirty = true
   } catch (_err) {
     // Silently fail — never crash the observer
   }
@@ -549,7 +608,11 @@ async function autoDetectFromToolResult(
   outputText: string,
   storage: StorageEngineLike,
   log: ReturnType<typeof createLogger>,
+  projectRoot?: string,
 ): Promise<void> {
+  const saveFact = (category: string, content: string, _log?: unknown) =>
+    autoSaveFact(storage, category, content, log, projectRoot)
+
   try {
     // Read tool: проверяем, какой файл читали
     if (toolName === "read" || toolName === "Read") {
@@ -557,25 +620,25 @@ async function autoDetectFromToolResult(
       if (filePath &&
         (filePath.endsWith(".json") || filePath.endsWith(".yaml") || filePath.endsWith(".yml") ||
          filePath.endsWith("AGENTS.md") || filePath.endsWith("CONTEXT.md") || filePath.endsWith("CLAUDE.md"))) {
-        await autoDetectFromFile(storage, filePath, log)
+        await autoDetectFromFile(storage, filePath, log, projectRoot)
 
         // Попытка парсинга package.json из результата чтения
         if ((filePath.endsWith("package.json") || filePath.endsWith("package.jsonc")) && outputText) {
           try {
             const pkg = JSON.parse(outputText) as Record<string, unknown>
             if (pkg.name) {
-              await autoSaveFact(storage, "CONFIG_VALUES", `Название проекта: ${pkg.name}`, log)
+              await saveFact("CONFIG_VALUES", `Название проекта: ${pkg.name}`, log)
             }
             if (pkg.dependencies) {
               const depCount = Object.keys(pkg.dependencies as object).length
-              await autoSaveFact(storage, "CONFIG_VALUES", `Зависимостей проекта: ${depCount}`, log)
+              await saveFact("CONFIG_VALUES", `Зависимостей проекта: ${depCount}`, log)
             }
             if (pkg.scripts) {
               const scriptNames = Object.keys(pkg.scripts as object)
-              if (scriptNames.includes("build")) await autoSaveFact(storage, "CONFIG_VALUES", `Скрипт сборки: npm run build`, log)
-              if (scriptNames.includes("test")) await autoSaveFact(storage, "CONFIG_VALUES", `Скрипт тестов: npm test`, log)
-              if (scriptNames.includes("lint")) await autoSaveFact(storage, "CONFIG_VALUES", `Скрипт линтинга: npm run lint`, log)
-              if (scriptNames.includes("dev")) await autoSaveFact(storage, "CONFIG_VALUES", `Скрипт разработки: npm run dev`, log)
+              if (scriptNames.includes("build")) await saveFact("CONFIG_VALUES", `Скрипт сборки: npm run build`, log)
+              if (scriptNames.includes("test")) await saveFact("CONFIG_VALUES", `Скрипт тестов: npm test`, log)
+              if (scriptNames.includes("lint")) await saveFact("CONFIG_VALUES", `Скрипт линтинга: npm run lint`, log)
+              if (scriptNames.includes("dev")) await saveFact("CONFIG_VALUES", `Скрипт разработки: npm run dev`, log)
             }
           } catch (_parseErr) {
             // Invalid JSON — ignore
@@ -589,10 +652,10 @@ async function autoDetectFromToolResult(
             const cleaned = outputText.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
             const tsconfig = JSON.parse(cleaned) as Record<string, unknown>
             const compilerOptions = (tsconfig.compilerOptions || {}) as Record<string, unknown>
-            if (compilerOptions.target) await autoSaveFact(storage, "CONFIG_VALUES", `TypeScript target: ${compilerOptions.target}`, log)
-            if (compilerOptions.module) await autoSaveFact(storage, "CONFIG_VALUES", `TypeScript module: ${compilerOptions.module}`, log)
-            if (compilerOptions.strict === true) await autoSaveFact(storage, "CONFIG_VALUES", "TypeScript strict mode включён", log)
-            if (compilerOptions.jsx) await autoSaveFact(storage, "CONFIG_VALUES", `TypeScript JSX: ${compilerOptions.jsx}`, log)
+            if (compilerOptions.target) await saveFact("CONFIG_VALUES", `TypeScript target: ${compilerOptions.target}`, log)
+            if (compilerOptions.module) await saveFact("CONFIG_VALUES", `TypeScript module: ${compilerOptions.module}`, log)
+            if (compilerOptions.strict === true) await saveFact("CONFIG_VALUES", "TypeScript strict mode включён", log)
+            if (compilerOptions.jsx) await saveFact("CONFIG_VALUES", `TypeScript JSX: ${compilerOptions.jsx}`, log)
           } catch (_parseErr) {
             // Invalid JSON — ignore
           }
@@ -605,31 +668,31 @@ async function autoDetectFromToolResult(
       const pattern = (args.pattern as string) || ""
 
       if (pattern.includes("src/components") || pattern.includes("components/**/*.tsx")) {
-        await autoSaveFact(storage, "ARCHITECTURE", "Компоненты находятся в src/components/", log)
+        await saveFact("ARCHITECTURE", "Компоненты находятся в src/components/", log)
       }
       if (pattern.includes("src/utils") || pattern.includes("utils/**")) {
-        await autoSaveFact(storage, "ARCHITECTURE", "Утилиты находятся в src/utils/", log)
+        await saveFact("ARCHITECTURE", "Утилиты находятся в src/utils/", log)
       }
       if (pattern.includes("src/hooks") || pattern.includes("hooks/**")) {
-        await autoSaveFact(storage, "ARCHITECTURE", "Хуки находятся в src/hooks/", log)
+        await saveFact("ARCHITECTURE", "Хуки находятся в src/hooks/", log)
       }
       if (pattern.includes("src/pages") || pattern.includes("pages/**")) {
-        await autoSaveFact(storage, "ARCHITECTURE", "Страницы находятся в src/pages/", log)
+        await saveFact("ARCHITECTURE", "Страницы находятся в src/pages/", log)
       }
       if (pattern.includes("src/app") || pattern.includes("app/**")) {
-        await autoSaveFact(storage, "ARCHITECTURE", "Next.js App Router: src/app/", log)
+        await saveFact("ARCHITECTURE", "Next.js App Router: src/app/", log)
       }
       if (pattern.includes("tests") || pattern.includes("__tests__") || pattern.includes(".test.") || pattern.includes(".spec.")) {
-        await autoSaveFact(storage, "NAMING", "Тесты обнаружены через glob-поиск", log)
+        await saveFact("NAMING", "Тесты обнаружены через glob-поиск", log)
       }
       if (pattern.includes("*.tsx") || pattern.includes("*.ts")) {
-        await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует TypeScript (обнаружено через glob)", log)
+        await saveFact("CONFIG_VALUES", "Проект использует TypeScript (обнаружено через glob)", log)
       }
       if (pattern.includes("*.vue")) {
-        await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Vue (обнаружено через glob)", log)
+        await saveFact("CONFIG_VALUES", "Проект использует Vue (обнаружено через glob)", log)
       }
       if (pattern.includes("*.svelte")) {
-        await autoSaveFact(storage, "CONFIG_VALUES", "Проект использует Svelte (обнаружено через glob)", log)
+        await saveFact("CONFIG_VALUES", "Проект использует Svelte (обнаружено через glob)", log)
       }
     }
   } catch (_err) {
@@ -648,6 +711,38 @@ export function createObserver(
   client?: any,
 ): ObserverHooks {
 
+  // -------------------------------------------------------------------------
+  // Per-instance state: multiple OpenCode workspaces can load the plugin in the
+  // same process, so loop guards must not be shared between instances.
+  // -------------------------------------------------------------------------
+
+  /** Отслеживание времени старта инструментов: ключ = `${sessionId}:${callId}` */
+  const toolStartTimes = new Map<string, number>()
+
+  /** Same failing tool signature repeated in one session. */
+  const toolLoopMap = new Map<string, ToolLoopState>()
+
+  /** Repeated successful write/edit per file in one session. */
+  const successfulEditLoopMap = new Map<string, SuccessfulEditLoopState>()
+
+  /** Отслеживание файлов, отредактированных в каждой сессии (для авто-саммари) */
+  const sessionFilesMap = new Map<string, Set<string>>()
+
+  /** ID текущей активной сессии — обновляется из session.created / tool.execute */
+  let currentSessionId = ""
+
+  /** Флаг для немедленного обновления CRUSH.md при изменении данных */
+  let crushDirty = false
+
+  /** Message IDs already counted into session metrics (message.updated fires repeatedly). */
+  const countedMessages = new Set<string>()
+
+  /** Last successful agent mutation per normalized file path (human-fix heuristic). */
+  const recentAgentEdits = new Map<string, number>()
+
+  /** Dedup between event: file.edited and the legacy direct file.edited hook. */
+  const recentFileEditWrites = new Map<string, number>()
+
   // =========================================================================
   // Обработчик события: диспетчер на основе event.type
   // =========================================================================
@@ -660,8 +755,20 @@ export function createObserver(
         case "file.edited":
           await handleFileEdited(evt.properties)
           break
+        case "file.watcher.updated":
+          handleFileWatcherUpdated(evt.properties)
+          break
         case "session.created":
           await handleSessionCreated(evt.properties)
+          break
+        case "session.updated":
+          handleSessionUpdated(evt.properties)
+          break
+        case "session.deleted":
+          handleSessionDeleted(evt.properties)
+          break
+        case "session.status":
+          await handleSessionStatus(evt.properties)
           break
         case "session.idle":
           await handleSessionIdle(evt.properties)
@@ -678,11 +785,17 @@ export function createObserver(
         case "message.updated":
           await handleMessageUpdated(evt.properties)
           break
+        case "message.part.updated":
+          handleMessagePartUpdated(evt.properties)
+          break
         case "todo.updated":
           await handleTodoUpdated(evt.properties)
           break
         case "lsp.client.diagnostics":
           await handleLspClientDiagnostics(evt.properties)
+          break
+        case "lsp.updated":
+          await handleLspUpdated(evt.properties)
           break
         case "lsp.diagnostic":
           await handleLspDiagnostic(evt.properties)
@@ -693,6 +806,51 @@ export function createObserver(
       }
     } catch (err) {
       log.error("Критическая ошибка в event dispatcher", err)
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Общие помощники состояния сессии
+  // -------------------------------------------------------------------------
+
+  function updateSessionAgentType(sessionId: string, rawAgent: unknown): void {
+    const agentType = normalizeAgentType(rawAgent)
+    if (!sessionId || agentType === "general") return
+    const session = storage.getSession(sessionId)
+    if (!session || session.agentType === agentType) return
+    storage.getDb().prepare("UPDATE sessions SET agent_type = ?1 WHERE id = ?2").run(agentType, sessionId)
+  }
+
+  function activateSession(sessionId: string): void {
+    if (!sessionId) return
+    const session = storage.getSession(sessionId)
+    if (!session || session.status === "active") return
+    storage.updateSessionStatus(sessionId, "active")
+  }
+
+  function clearSessionRuntimeState(sessionId: string): void {
+    resetSuccessfulEditLoops(sessionId)
+    const prefix = `${sessionId}:`
+    for (const key of toolStartTimes.keys()) {
+      if (key.startsWith(prefix)) toolStartTimes.delete(key)
+    }
+    for (const key of toolLoopMap.keys()) {
+      if (key.startsWith(prefix)) toolLoopMap.delete(key)
+    }
+  }
+
+  function showToast(payload: { title: string; message: string; variant: "info" | "success" | "warning" | "error"; duration?: number }): void {
+    if (!client) return
+    try {
+      if (typeof client.tui?.showToast === "function") {
+        void client.tui.showToast({ body: payload })
+        return
+      }
+      if (typeof client.tui?.toast?.show === "function") {
+        void client.tui.toast.show(payload)
+      }
+    } catch {
+      // Host toast API may differ between OpenCode versions.
     }
   }
 
@@ -711,13 +869,20 @@ export function createObserver(
   }
 
   async function handleChatMessage(
-    input: { sessionID: string; messageID?: string },
+    input: { sessionID: string; messageID?: string; agent?: string },
     output: { parts: Array<Record<string, unknown>> },
   ): Promise<void> {
     try {
       resetSuccessfulEditLoops(input.sessionID)
       const session = storage.getSession(input.sessionID)
       if (!session) return
+      // The real Session payload has no agent field: the agent identity is
+      // delivered per message, and the status must leave idle/compacted/error
+      // once the user sends a new message.
+      updateSessionAgentType(input.sessionID, input.agent)
+      if (session.status !== "active") {
+        storage.updateSessionStatus(input.sessionID, "active")
+      }
       const text = (output.parts || [])
         .filter((part) => part.type === "text" || typeof part.text === "string")
         .map((part) => String(part.text || part.content || ""))
@@ -767,7 +932,7 @@ export function createObserver(
     output: { status: "ask" | "deny" | "allow" },
   ): Promise<void> {
     try {
-      if (!/^(edit|write)$/i.test(input.type)) return
+      if (!isMutatingFileTool(input.type)) return
       const session = storage.getSession(input.sessionID)
       if (!session) return
       const targets = Array.isArray(input.pattern) ? input.pattern : input.pattern ? [input.pattern] : []
@@ -783,11 +948,10 @@ export function createObserver(
       }
 
       const contracts = storage.getDb().prepare(`SELECT id, allowed_paths, forbidden_paths FROM change_contracts WHERE project_root = ?1 AND status = 'active'`).all(session.projectRoot) as Array<{ id: string; allowed_paths: string; forbidden_paths: string }>
-      const matches = (pattern: string, value: string) => pattern === "*" || value === pattern || value.startsWith(pattern.replace(/[*]$/, ""))
       for (const contract of contracts) {
         const allowed = JSON.parse(contract.allowed_paths || "[]") as string[]
         const forbidden = JSON.parse(contract.forbidden_paths || "[]") as string[]
-        const violations = targets.filter((target) => forbidden.some((pattern) => matches(pattern, target)) || (allowed.length > 0 && !allowed.some((pattern) => matches(pattern, target))))
+        const violations = targets.filter((target) => forbidden.some((pattern) => pathMatches(pattern, target, session.projectRoot)) || (allowed.length > 0 && !allowed.some((pattern) => pathMatches(pattern, target, session.projectRoot))))
         if (violations.length > 0) {
           output.status = "deny"
           storage.enqueue("developer_events", {
@@ -812,22 +976,58 @@ export function createObserver(
   // 1. file.edited — каждое изменение файла
   // =========================================================================
 
-  function extractCommand(args: Record<string, unknown>, title: string): string {
+  function extractCommand(args: Record<string, unknown>): string | null {
     for (const key of ["command", "cmd", "script", "input"]) {
       if (typeof args[key] === "string" && String(args[key]).trim()) return String(args[key]).trim()
     }
-    return title.trim()
+    return null
   }
 
   function isVerificationCommand(command: string): boolean {
-    return /\b(test|typecheck|build|lint|check|verify|compile|tsc|eslint|vitest|jest)\b/i.test(command)
+    const cmd = command.trim()
+    if (!cmd) return false
+
+    // A masked exit status must not become "verified" evidence.
+    if (/\|\|\s*(?:true|:)\b/i.test(cmd)) return false
+    if (/;\s*(?:true|:)\s*(?:#.*)?$/i.test(cmd)) return false
+
+    // Inspection commands that merely mention "test" or "build".
+    const executable = cmd.split(/\s+/)[0]?.toLowerCase() || ""
+    if (/^(echo|printf|cat|ls|dir|find|grep|rg|head|tail|less|more|type)$/.test(executable)) {
+      return false
+    }
+
+    const invocationPatterns = [
+      /\b(?:npm|pnpm|yarn|bun|npx|deno)\s+(?:run\s+)?(?:test|typecheck|lint|build|check|verify|compile)\b/i,
+      /\btsc\b/i,
+      /\beslint\b/i,
+      /\bvitest\b/i,
+      /\bjest\b/i,
+      /\bmocha\b/i,
+      /\bpytest\b/i,
+      /\bcargo\s+(?:test|check|build|clippy)\b/i,
+      /\bgo\s+(?:test|vet|build)\b/i,
+      /\b(?:mvn|gradle|\.\/gradlew|mvnw)\s+(?:test|verify|check|build)\b/i,
+      /\bdotnet\s+(?:test|build)\b/i,
+      /\bmake\s+(?:test|check|lint|build)\b/i,
+      /\b(?:python|python3)\s+-m\s+(?:pytest|unittest|compileall)\b/i,
+    ]
+    return invocationPatterns.some((pattern) => pattern.test(cmd))
+  }
+
+  function outputIndicatesFailure(output: string): boolean {
+    const tail = output.slice(-4000)
+    if (!tail) return false
+    if (/\berror TS\d+\b/i.test(tail)) return true
+    if (/(^|\n)\s*(?:FAIL|✗|✕)\b/.test(tail)) return true
+    const failedMatch = /([1-9]\d*)\s+(?:failing|failed)/i.exec(tail)
+    return failedMatch !== null
   }
 
   function captureCommandEvidence(
     toolName: string,
     sessionId: string,
     args: Record<string, unknown>,
-    title: string,
     resultOutput: string,
     status: string,
   ): void {
@@ -837,12 +1037,15 @@ export function createObserver(
       // A file path can contain words such as "test" or "build". Never
       // classify write/edit titles as verification commands based on that
       // path, otherwise a successful file write would reset the edit-loop
-      // guard accidentally.
+      // guard accidentally. Only an explicit command argument counts.
       if (isMutatingFileTool(toolName)) return
-      const command = extractCommand(args, title)
-      if (!isVerificationCommand(command)) return
+      const isShellTool = /^(bash|shell|exec|command|run|terminal|powershell|pwsh|cmd)$/i.test(toolName)
+      const hasExplicitCommand = typeof args.command === "string" || typeof args.cmd === "string"
+      if (!isShellTool && !hasExplicitCommand) return
+      const command = extractCommand(args)
+      if (!command || !isVerificationCommand(command)) return
       const activeTask = storage.listTasks(session.projectRoot, "active", 1)[0]
-      const successful = status === "success"
+      const successful = status === "success" && !outputIndicatesFailure(resultOutput)
       storage.recordEvidence({
         projectRoot: session.projectRoot,
         taskId: activeTask?.id || null,
@@ -867,16 +1070,22 @@ export function createObserver(
       toolLoopMap.delete(key)
       return
     }
-    const previous = toolLoopMap.get(key) || { count: 0, lastStatus: status }
-    previous.count += 1
-    previous.lastStatus = status
-    toolLoopMap.set(key, previous)
-    if (previous.count === 3) {
+    const now = Date.now()
+    const previous = toolLoopMap.get(key)
+    const state: ToolLoopState = previous && now - previous.lastAt <= TOOL_LOOP_WINDOW_MS
+      ? previous
+      : { count: 0, lastStatus: status, lastAt: now }
+    state.count += 1
+    state.lastStatus = status
+    state.lastAt = now
+    if (toolLoopMap.size >= MAX_TRACKED_KEYS) toolLoopMap.clear()
+    toolLoopMap.set(key, state)
+    if (state.count === 3) {
       const session = storage.getSession(sessionId)
       if (!session) return
       const activeTask = storage.listTasks(session.projectRoot, "active", 1)[0]
       storage.getDb().prepare(`INSERT INTO developer_events (event_type, session_id, file_path, metadata, timestamp) VALUES (?1,?2,NULL,?3,?4)`).run(
-        "tool_rejected", sessionId, JSON.stringify({ reason: "agent_loop_detected", tool: toolName, signature: argsPreview, repeats: previous.count }), Date.now(),
+        "tool_rejected", sessionId, JSON.stringify({ reason: "agent_loop_detected", tool: toolName, signature: argsPreview, repeats: state.count }), Date.now(),
       )
       log.warn(`Agent loop detected: ${toolName} повторён 3 раза с ошибкой; task=${activeTask?.id || "none"}`)
     }
@@ -925,6 +1134,7 @@ export function createObserver(
     }
     const fingerprint = getEditFingerprint(toolName, args)
     if (fingerprint) state.fingerprints.set(fingerprint, (state.fingerprints.get(fingerprint) || 0) + 1)
+    rememberBounded(recentAgentEdits, normalizeTrackedPath(filePath), now)
 
     if (state.count === SUCCESSFUL_EDIT_LOOP_WARNING_COUNT && !state.warned) {
       state.warned = true
@@ -1002,22 +1212,31 @@ export function createObserver(
     try {
       const filePath = (properties.file as string) || (properties.filePath as string) || (properties.path as string) || "unknown"
       const sessionId = (properties.sessionID as string) || currentSessionId || "unknown"
-      const agentType = normalizeAgentType(properties.agentType || properties.agent)
-      const editType = normalizeEditType(properties.editType || properties.type)
-      const diffPreview = (properties.diff as string) || null
-      const linesAdded = (properties.additions as number) || (properties.linesAdded as number) || 0
-      const linesRemoved = (properties.deletions as number) || (properties.linesRemoved as number) || 0
-      const timestamp = (properties.timestamp as number) || Date.now()
+      const dedupeKey = `${sessionId}:${normalizeTrackedPath(filePath)}`
+      const lastWrite = recentFileEditWrites.get(dedupeKey)
+      if (lastWrite && Date.now() - lastWrite < FILE_EDIT_DEDUP_MS) {
+        log.debug(`file.edited: дубликат ${filePath} пропущен`)
+        return
+      }
+      rememberBounded(recentFileEditWrites, dedupeKey, Date.now())
 
       let projectRoot = (properties.projectRoot as string) || (properties.directory as string) || ""
-      if (!projectRoot && sessionId !== "unknown") {
+      let sessionAgent: unknown = undefined
+      if (sessionId !== "unknown") {
         try {
           const session = storage.getSession(sessionId)
           if (session?.projectRoot) {
-            projectRoot = session.projectRoot as string
+            projectRoot = projectRoot || (session.projectRoot as string)
           }
+          sessionAgent = session?.agentType
         } catch { /* ок */ }
       }
+      const agentType = normalizeAgentType(properties.agentType || properties.agent || sessionAgent)
+      const editType = normalizeEditType(properties.editType || properties.type)
+      const diffPreview = (properties.diff as string) || null
+      const linesAdded = (properties.added as number) || (properties.additions as number) || (properties.linesAdded as number) || 0
+      const linesRemoved = (properties.removed as number) || (properties.deletions as number) || (properties.linesRemoved as number) || 0
+      const timestamp = (properties.timestamp as number) || Date.now()
 
       // Обрезаем дифф до config.maxDiffPreviewChars
       let truncatedDiff: string | null = null
@@ -1063,12 +1282,11 @@ export function createObserver(
             `SELECT id, allowed_paths, forbidden_paths, violations FROM change_contracts
              WHERE project_root = ?1 AND status = 'active'`,
           ).all(projectRoot) as Array<{ id: string; allowed_paths: string; forbidden_paths: string; violations: string }>
-          const matches = (pattern: string, value: string) => pattern === "*" || value === pattern || value.startsWith(pattern.replace(/[*]$/, ""))
           for (const contract of activeContracts) {
             const allowed = JSON.parse(contract.allowed_paths || "[]") as string[]
             const forbidden = JSON.parse(contract.forbidden_paths || "[]") as string[]
-            const forbiddenHit = forbidden.some((pattern) => matches(pattern, filePath))
-            const outsideAllowed = allowed.length > 0 && !allowed.some((pattern) => matches(pattern, filePath))
+            const forbiddenHit = forbidden.some((pattern) => pathMatches(pattern, filePath, projectRoot))
+            const outsideAllowed = allowed.length > 0 && !allowed.some((pattern) => pathMatches(pattern, filePath, projectRoot))
             if (forbiddenHit || outsideAllowed) {
               const previous = JSON.parse(contract.violations || "[]") as string[]
               const violations = Array.from(new Set([...previous, filePath]))
@@ -1089,8 +1307,9 @@ export function createObserver(
       }
       sessionFilesMap.get(sessionId)!.add(filePath)
 
-      // Auto-Memory: обнаружение фактов о проекте
-      autoDetectFromFile(storage, filePath, log)
+      // Auto-Memory: обнаружение фактов о проекте (project-scoped)
+      void autoDetectFromFile(storage, filePath, log, projectRoot)
+      crushDirty = true
 
       log.debug(`file.edited: ${filePath} (${language}, +${linesAdded}/-${linesRemoved})`)
     } catch (err) {
@@ -1149,40 +1368,25 @@ export function createObserver(
         timestamp,
       })
 
-      // Авто-инжект контекста для новой сессии
-      try {
-        const projectName = projectRoot.split(/[\\/]/).pop() || ""
-        if (projectName) {
+      // Контекст памяти проекта (один COUNT на создание сессии)
+      if (projectRoot) {
+        try {
           const db = storage.getDb()
           const row = db.prepare(
             "SELECT COUNT(*) as cnt FROM knowledge_nodes"
           ).get() as { cnt: number } | undefined
-          if (row && row.cnt > 0) {
-            log.info(`Авто-контекст: проект "${projectRoot}" имеет ${row.cnt}+ фактов в памяти`)
-          }
-        }
-      } catch { /* silently ignore */ }
-
-      // Проактивный режим: если client доступен, логируем готовность
-      if (client && projectRoot) {
-        try {
-          const db = storage.getDb()
-          const kRow = db.prepare(
-            "SELECT COUNT(*) as cnt FROM knowledge_nodes"
-          ).get() as { cnt: number } | undefined
           const projectName = projectRoot.split(/[\\/]/).pop() || ""
-          const factsCount = kRow?.cnt ?? 0
+          const factsCount = row?.cnt ?? 0
           log.info(`Проактивный режим: проект "${projectName}", фактов: ${factsCount}`)
-
-          if (typeof client.tui?.toast?.show === "function") {
-            client.tui.toast.show({
-              variant: "info",
+          if (factsCount > 0) {
+            showToast({
               title: "Code Shadow",
-              message: `Контекст загружен. Используй code_shadow_analyze и code_shadow_memory_search.`,
+              message: "Контекст загружен. Используй code_shadow_analyze и code_shadow_memory_search.",
+              variant: "info",
               duration: 3000,
             })
           }
-        } catch { /* client API may differ */ }
+        } catch { /* silently ignore */ }
       }
 
       log.info(`Сессия ${sessionId} создана (agent: ${agentType}, project: ${projectRoot})`)
@@ -1211,6 +1415,14 @@ export function createObserver(
         log.warn(`session.idle: сессия ${sessionId} не найдена`)
         return
       }
+      if (session.status === "idle" && session.endedAt) {
+        log.debug(`session.idle: дубликат для ${sessionId} пропущен`)
+        return
+      }
+
+      // file_edits/tool_executions пишутся через batch queue: без flush
+      // counts ниже всегда были бы занижены или нулевыми.
+      storage.flushBatch()
 
       const startedAt = (session.startedAt as number) || endedAt
       const duration = endedAt - startedAt
@@ -1271,6 +1483,7 @@ export function createObserver(
               full_content: `Session ${sessionId.substring(0, 8)} worked on ${filesArray.length} files`,
             },
             updatedAt: Date.now(),
+            projectRoot: (session.projectRoot as string) || null,
           })
 
           log.debug(`Авто-саммари сессии ${sessionId}: ${filesArray.length} файлов`)
@@ -1283,6 +1496,7 @@ export function createObserver(
       }
 
       crushDirty = true
+      clearSessionRuntimeState(sessionId)
 
       const durationSec = (duration / 1000).toFixed(1)
       log.info(`Сессия ${sessionId} завершена (длительность: ${durationSec}с, файлов: ${filesCount?.cnt ?? 0})`)
@@ -1298,22 +1512,31 @@ export function createObserver(
   async function handleSessionError(properties: Record<string, unknown>): Promise<void> {
     try {
       const sessionId = (properties.sessionID as string) || currentSessionId || "unknown"
-      const errorData = properties.error as Record<string, unknown> | undefined
-      const errorMessage = errorData
-        ? ((errorData.data as Record<string, unknown>)?.message as string) || (errorData.name as string) || "Неизвестная ошибка"
-        : "Неизвестная ошибка"
+      const errorData = properties.error as { name?: string; data?: Record<string, unknown> } | undefined
+      const errorName = errorData?.name || ""
+
+      // Aborted turns are user actions, not failures: counting them would
+      // inflate the error rate for every manual cancel.
+      if (errorName === "MessageAbortedError") {
+        log.debug(`Ошибка сессии ${sessionId}: прервано пользователем (пропущено)`)
+        return
+      }
+
+      const errorMessage = (errorData?.data?.message as string) || errorName || "Неизвестная ошибка"
       const stackTrace = (properties.stackTrace as string) || null
       const contextFile = (properties.contextFile as string) || (properties.file as string) || null
       const contextTool = (properties.contextTool as string) || (properties.tool as string) || null
       const timestamp = (properties.timestamp as number) || Date.now()
 
-      // Определение типа ошибки
+      // Реальные имена ошибок SDK 1.18.x: ProviderAuthError, UnknownError,
+      // MessageOutputLengthError, MessageAbortedError, APIError.
       let errorType = "unknown"
-      if (errorData) {
-        const name = errorData.name as string
-        if (name === "ProviderAuthError") errorType = "model_error"
-        else if (name === "PermissionError") errorType = "permission_denied"
-        else if (name === "ToolError" || contextTool) errorType = "tool_error"
+      if (errorName === "ProviderAuthError" || errorName === "APIError" || errorName === "MessageOutputLengthError") {
+        errorType = "model_error"
+      } else if (contextTool) {
+        errorType = "tool_error"
+      } else if (/permission/i.test(errorName) || /permission denied/i.test(errorMessage)) {
+        errorType = "permission_denied"
       }
 
       // Санитизация сообщения об ошибке
@@ -1336,6 +1559,7 @@ export function createObserver(
         // Инкрементируем счётчик только для существующей сессии.
         const db = storage.getDb()
         db.prepare("UPDATE sessions SET errors_count = errors_count + 1 WHERE id = ?").run(sessionId)
+        storage.updateSessionStatus(sessionId, "error")
       } else {
         log.warn(`Ошибка ${sessionId} не сохранена: сессия не найдена`)
       }
@@ -1352,44 +1576,53 @@ export function createObserver(
 
   async function handleSessionCompacted(properties: Record<string, unknown>): Promise<void> {
     try {
-      const newSessionId = (properties.sessionID as string) || ""
-      const oldSessionId = (properties.compactedSessionID as string) || (properties.parentID as string) || null
-      const timestamp = (properties.timestamp as number) || Date.now()
-      const projectRoot = (properties.directory as string) || ""
-
-      if (!newSessionId) {
+      // In the real SDK the session keeps its id after compaction; the event
+      // only reports which session was compacted.
+      const sessionId = (properties.sessionID as string) || ""
+      if (!sessionId) {
         log.warn("session.compacted: отсутствует sessionID")
         return
       }
 
-      // Получаем старую сессию для переноса данных — используем РЕАЛЬНЫЙ метод getSession
-      const oldSession = oldSessionId
-        ? storage.getSession(oldSessionId)
-        : null
-
-      // Вставка новой сессии — результат компактизации — используем РЕАЛЬНЫЙ метод insertSession
-      storage.insertSession({
-        id: newSessionId,
-        agentType: (oldSession?.agentType as string) || "general",
-        status: "active",
-        startedAt: timestamp,
-        endedAt: null,
-        durationMs: null,
-        filesChangedCount: (oldSession?.filesChangedCount as number) || 0,
-        toolsUsedCount: (oldSession?.toolsUsedCount as number) || 0,
-        errorsCount: (oldSession?.errorsCount as number) || 0,
-        projectRoot: projectRoot || (oldSession?.projectRoot as string) || "",
-        messageCount: 0,
-        totalTokensUsed: (oldSession?.totalTokensUsed as number) || 0,
-        compactedFrom: oldSessionId,
-      })
-
-      // Помечаем старую сессию как compacted — используем РЕАЛЬНЫЙ метод updateSessionStatus
-      if (oldSessionId) {
-        storage.updateSessionStatus(oldSessionId, "compacted")
+      const session = storage.getSession(sessionId)
+      if (!session) {
+        log.debug(`session.compacted: сессия ${sessionId} не найдена`)
+        return
       }
 
-      log.info(`Сессия ${oldSessionId || "?"} компактизирована → ${newSessionId}`)
+      storage.flushBatch()
+      const endedAt = Date.now()
+      const startedAt = (session.startedAt as number) || endedAt
+      const duration = endedAt - startedAt
+      const db = storage.getDb()
+      const filesCount = db.prepare(
+        "SELECT COUNT(DISTINCT file_path) as cnt FROM file_edits WHERE session_id = ?"
+      ).get(sessionId) as { cnt: number } | undefined
+      const toolsCount = db.prepare(
+        "SELECT COUNT(*) as cnt FROM tool_executions WHERE session_id = ?"
+      ).get(sessionId) as { cnt: number } | undefined
+      const errorsCount = db.prepare(
+        "SELECT COUNT(*) as cnt FROM session_errors WHERE session_id = ?"
+      ).get(sessionId) as { cnt: number } | undefined
+
+      storage.updateSessionStatus(sessionId, "compacted", {
+        endedAt,
+        durationMs: duration,
+        filesChangedCount: filesCount?.cnt ?? 0,
+        toolsUsedCount: toolsCount?.cnt ?? 0,
+        errorsCount: errorsCount?.cnt ?? 0,
+      })
+
+      storage.enqueue("developer_events", {
+        event_type: "session_end",
+        session_id: sessionId,
+        file_path: null,
+        metadata: JSON.stringify({ reason: "compacted", duration_ms: duration }),
+        timestamp: endedAt,
+      })
+
+      crushDirty = true
+      log.info(`Сессия ${sessionId} компактизирована (длительность: ${(duration / 1000).toFixed(1)}с)`)
     } catch (err) {
       log.error("Ошибка в handleSessionCompacted", err)
     }
@@ -1406,6 +1639,7 @@ export function createObserver(
       const args = (properties.arguments as string) || ""
       const messageId = (properties.messageID as string) || null
       const timestamp = Date.now()
+      const safeArgs = sanitizeContent(args, config.secretPatterns)
 
       // Вставка developer event (тип: 'command_used')
       storage.enqueue("developer_events", {
@@ -1414,7 +1648,7 @@ export function createObserver(
         file_path: null,
         metadata: JSON.stringify({
           command: commandName,
-          full_input: `${commandName} ${args}`,
+          full_input: `${commandName} ${safeArgs}`,
           message_id: messageId,
         }),
         timestamp,
@@ -1427,7 +1661,7 @@ export function createObserver(
   }
 
   // =========================================================================
-  // 7. message.updated — обнаружение паттерна "AI написал, человек исправил"
+  // 7. message.updated — метрики сообщений (реальный payload SDK)
   // =========================================================================
 
   async function handleMessageUpdated(properties: Record<string, unknown>): Promise<void> {
@@ -1436,54 +1670,140 @@ export function createObserver(
       if (!info) return
 
       const role = (info.role as string) || ""
-      const sessionId = (info.sessionID as string) || "unknown"
+      const sessionId = (info.sessionID as string) || ""
       const messageId = (info.id as string) || ""
-      const timestamp = (info.time as Record<string, unknown>)?.created as number || Date.now()
+      const time = info.time as Record<string, unknown> | undefined
 
-      // Нас интересуют только сообщения ассистента,
-      // которые были отредактированы человеком
-      // Эвристика: если роль assistant и сообщение содержит кодовые блоки —
-      // считаем это исправлением AI-кода человеком
-      if (role !== "assistant") return
-
-      // Проверяем наличие кодовых блоков в сообщении
-      const text = (info.text as string) || ""
-      const parts = info.parts as Array<Record<string, unknown>> | undefined
-      let combinedText = text
-      if (parts) {
-        for (const part of parts) {
-          if (part.type === "text" && part.text) {
-            combinedText += (part.text as string)
-          }
-        }
+      if (role !== "assistant" || !sessionId) return
+      if (!storage.getSession(sessionId)) return
+      // Streaming emits message.updated many times; only the final snapshot
+      // carries completed+final token counts.
+      if (!time?.completed) return
+      if (messageId) {
+        if (countedMessages.has(messageId)) return
+        if (countedMessages.size >= MAX_TRACKED_KEYS) countedMessages.clear()
+        countedMessages.add(messageId)
       }
 
-      const hasCodeBlocks = combinedText.includes("```") || combinedText.includes("`")
-      if (!hasCodeBlocks) return
+      const tokens = info.tokens as Record<string, number> | undefined
+      const tokenTotal = (tokens?.input || 0) + (tokens?.output || 0)
+      const db = storage.getDb()
+      db.prepare(
+        "UPDATE sessions SET message_count = message_count + 1, total_tokens_used = total_tokens_used + ?1 WHERE id = ?2",
+      ).run(tokenTotal, sessionId)
 
-      // Получаем связанный файл из контекста
-      const summary = info.summary as Record<string, unknown> | undefined
-      const diffs = summary?.diffs as Array<Record<string, unknown>> | undefined
-      const relatedFile = diffs && diffs.length > 0
-        ? (diffs[0].file as string)
-        : null
+      updateSessionAgentType(sessionId, info.mode)
+      log.debug(`message.updated: ${sessionId} — assistant message ${messageId || "?"}, tokens=${tokenTotal}`)
+    } catch (err) {
+      log.error("Ошибка в handleMessageUpdated", err)
+    }
+  }
 
-      // Вставка developer event (тип: 'human_fix')
+  // =========================================================================
+  // 7b. message.part.updated — patch parts и текущая сессия
+  // =========================================================================
+
+  function handleMessagePartUpdated(properties: Record<string, unknown>): void {
+    try {
+      const part = properties.part as Record<string, unknown> | undefined
+      if (!part) return
+      const sessionId = (part.sessionID as string) || ""
+      if (sessionId) {
+        currentSessionId = sessionId
+        if (part.type === "patch" && Array.isArray(part.files)) {
+          const files = sessionFilesMap.get(sessionId) || new Set<string>()
+          for (const file of part.files) {
+            if (typeof file === "string" && file) files.add(file)
+          }
+          sessionFilesMap.set(sessionId, files)
+        }
+      }
+    } catch (err) {
+      log.debug(`message.part.updated пропущен: ${String(err)}`)
+    }
+  }
+
+  // =========================================================================
+  // 7c. session.updated / session.deleted / session.status
+  // =========================================================================
+
+  function handleSessionUpdated(properties: Record<string, unknown>): void {
+    try {
+      const info = properties.info as Record<string, unknown> | undefined
+      const sessionId = (info?.id as string) || ""
+      if (!sessionId) return
+      const session = storage.getSession(sessionId)
+      if (!session) return
+      const directory = (info?.directory as string) || ""
+      if (!session.projectRoot && directory) {
+        storage.getDb().prepare("UPDATE sessions SET project_root = ?1 WHERE id = ?2").run(directory, sessionId)
+      }
+    } catch (err) {
+      log.debug(`session.updated пропущен: ${String(err)}`)
+    }
+  }
+
+  function handleSessionDeleted(properties: Record<string, unknown>): void {
+    try {
+      const info = properties.info as Record<string, unknown> | undefined
+      const sessionId = (info?.id as string) || ""
+      if (!sessionId) return
+      if (storage.getSession(sessionId)) {
+        storage.updateSessionStatus(sessionId, "deleted")
+      }
+      if (currentSessionId === sessionId) currentSessionId = ""
+      crushDirty = true
+    } catch (err) {
+      log.debug(`session.deleted пропущен: ${String(err)}`)
+    }
+  }
+
+  async function handleSessionStatus(properties: Record<string, unknown>): Promise<void> {
+    try {
+      const sessionId = (properties.sessionID as string) || ""
+      const status = properties.status as { type?: string } | undefined
+      if (!sessionId || !status?.type) return
+      if (status.type === "busy" || status.type === "retry") {
+        activateSession(sessionId)
+      } else if (status.type === "idle") {
+        await handleSessionIdle({ sessionID: sessionId })
+      }
+    } catch (err) {
+      log.debug(`session.status пропущен: ${String(err)}`)
+    }
+  }
+
+  // =========================================================================
+  // 7d. file.watcher.updated — human_fix после правки агентом
+  // =========================================================================
+
+  function handleFileWatcherUpdated(properties: Record<string, unknown>): void {
+    try {
+      const filePath = (properties.file as string) || ""
+      const changeKind = (properties.event as string) || ""
+      if (!filePath || changeKind !== "change") return
+      const key = normalizeTrackedPath(filePath)
+      const lastAgentEdit = recentAgentEdits.get(key)
+      if (!lastAgentEdit) return
+      const age = Date.now() - lastAgentEdit
+      if (age < AGENT_EDIT_SETTLE_MS) return
+      if (age > HUMAN_FIX_WINDOW_MS) {
+        recentAgentEdits.delete(key)
+        return
+      }
+      const sessionId = currentSessionId
+      if (!sessionId || !storage.getSession(sessionId)) return
+      recentAgentEdits.delete(key)
       storage.enqueue("developer_events", {
         event_type: "human_fix",
         session_id: sessionId,
-        file_path: relatedFile,
-        metadata: JSON.stringify({
-          message_id: messageId,
-          role: "assistant",
-          has_code_blocks: true,
-        }),
-        timestamp,
+        file_path: filePath,
+        metadata: JSON.stringify({ source: "file_watcher", agent_edit_age_ms: age }),
+        timestamp: Date.now(),
       })
-
-      log.debug(`message.updated: обнаружен human_fix для сессии ${sessionId}`)
+      log.info(`human_fix: ${filePath} изменён вне tool-вызова через ${Math.round(age / 1000)}с после правки агента`)
     } catch (err) {
-      log.error("Ошибка в handleMessageUpdated", err)
+      log.debug(`file.watcher.updated пропущен: ${String(err)}`)
     }
   }
 
@@ -1590,8 +1910,8 @@ export function createObserver(
       let hints = 0
 
       for (const diag of diagnostics) {
-        const severity = (diag.severity as string) || ""
-        if (severity === "error" || severity === "1") {
+        const severity = normalizeLspSeverity(diag.severity)
+        if (severity === "error") {
           errors++
 
           // Для каждой ошибки пишем developer event
@@ -1600,7 +1920,7 @@ export function createObserver(
             session_id: sessionId,
             file_path: filePath,
             metadata: JSON.stringify({
-              severity: "error",
+              severity,
               message: diag.message || "",
               line: diag.line,
               column: diag.column,
@@ -1609,9 +1929,9 @@ export function createObserver(
             }),
             timestamp,
           })
-        } else if (severity === "warning" || severity === "2") {
+        } else if (severity === "warning") {
           warnings++
-        } else if (severity === "hint" || severity === "info" || severity === "3" || severity === "4") {
+        } else {
           hints++
         }
       }
@@ -1637,7 +1957,25 @@ export function createObserver(
   }
 
   // =========================================================================
-  // 9b. lsp.diagnostic — реальные ошибки кода от LSP (TypeScript, ESLint и т.д.)
+  // 9b. lsp.updated — хосты, которые присылают diagnostics в lsp.updated
+  // =========================================================================
+
+  async function handleLspUpdated(properties: Record<string, unknown>): Promise<void> {
+    try {
+      const diagnostics = properties.diagnostics
+      if (!Array.isArray(diagnostics) || diagnostics.length === 0) return
+      await handleLspDiagnostic({
+        file: (properties.file as string) || (properties.path as string) || (properties.uri as string),
+        sessionID: properties.sessionID,
+        diagnostics: diagnostics as Array<Record<string, unknown>>,
+      })
+    } catch (err) {
+      log.debug(`lsp.updated пропущен: ${String(err)}`)
+    }
+  }
+
+  // =========================================================================
+  // 9c. lsp.diagnostic — реальные ошибки кода от LSP (TypeScript, ESLint и т.д.)
   // =========================================================================
 
   async function handleLspDiagnostic(properties: Record<string, unknown>): Promise<void> {
@@ -1650,7 +1988,10 @@ export function createObserver(
 
       for (const diag of diagnostics) {
         const message = String(diag.message || diag.text || "")
-        const severity = String(diag.severity || diag.type || "warning")
+        const severity = normalizeLspSeverity(diag.severity ?? diag.type)
+        // Warnings/info/hints must not inflate session_errors, breakage rate
+        // and hotspot scores. They remain visible in the editor/LSP itself.
+        if (severity !== "error") continue
         const range = diag.range as { start?: { line?: number; character?: number } } | undefined
         const line = Number(diag.line || range?.start?.line || 0)
         const column = Number(diag.column || range?.start?.character || 0)
@@ -1690,7 +2031,10 @@ export function createObserver(
       const callId = input.callID
 
       // Track current session
-      if (sessionId) currentSessionId = sessionId
+      if (sessionId) {
+        currentSessionId = sessionId
+        activateSession(sessionId)
+      }
 
       // Проверка: не отключён ли этот тип события
       if (config.disabledEventTypes.includes(toolName)) {
@@ -1702,31 +2046,30 @@ export function createObserver(
       const timingKey = `${sessionId}:${callId}`
       toolStartTimes.set(timingKey, Date.now())
 
-      // Для 'edit' и 'write' тулзов:
-      // Phase 4: proactive risk check goes here
-      // Пока только логируем вызов
-      if (toolName === "edit" || toolName === "write") {
-        log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId}, callId: ${callId}) — Phase 4: proactive risk check goes here`)
-        const target = String(output.args?.filePath || output.args?.file || output.args?.path || "")
-        if (target) assertEditLoopAllowed(sessionId, toolName, target)
+      if (isMutatingFileTool(toolName)) {
+        // Phase 4: proactive risk check goes here
+        log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId}, callId: ${callId})`)
+        const targets = extractMutatingTargets(output.args || {})
+        for (const target of targets) assertEditLoopAllowed(sessionId, toolName, target)
         const session = storage.getSession(sessionId)
-        if (target && session) {
+        if (targets.length > 0 && session) {
           try {
             const contracts = storage.getDb().prepare(`SELECT id, allowed_paths, forbidden_paths FROM change_contracts WHERE project_root = ?1 AND status = 'active'`).all(session.projectRoot) as Array<{ id: string; allowed_paths: string; forbidden_paths: string }>
-            const matches = (pattern: string, value: string) => pattern === "*" || value === pattern || value.startsWith(pattern.replace(/[*]$/, ""))
             for (const contract of contracts) {
               const allowed = JSON.parse(contract.allowed_paths || "[]") as string[]
               const forbidden = JSON.parse(contract.forbidden_paths || "[]") as string[]
-              const violation = forbidden.some((pattern) => matches(pattern, target)) || (allowed.length > 0 && !allowed.some((pattern) => matches(pattern, target)))
-              if (violation) {
-                storage.enqueue("developer_events", {
-                  event_type: "tool_rejected",
-                  session_id: sessionId,
-                  file_path: target,
-                  metadata: JSON.stringify({ reason: "change_contract_preflight", contract_id: contract.id, tool: toolName }),
-                  timestamp: Date.now(),
-                })
-                log.warn(`Preflight Change Contract warning: ${toolName} → ${target}, contract=${contract.id}`)
+              for (const target of targets) {
+                const violation = forbidden.some((pattern) => pathMatches(pattern, target, session.projectRoot)) || (allowed.length > 0 && !allowed.some((pattern) => pathMatches(pattern, target, session.projectRoot)))
+                if (violation) {
+                  storage.enqueue("developer_events", {
+                    event_type: "tool_rejected",
+                    session_id: sessionId,
+                    file_path: target,
+                    metadata: JSON.stringify({ reason: "change_contract_preflight", contract_id: contract.id, tool: toolName }),
+                    timestamp: Date.now(),
+                  })
+                  log.warn(`Preflight Change Contract warning: ${toolName} → ${target}, contract=${contract.id}`)
+                }
               }
             }
           } catch (preflightError) {
@@ -1757,7 +2100,6 @@ export function createObserver(
       const args = input.args || {}
       const resultOutput = output.output || ""
       const metadata = output.metadata || {}
-      const resultTitle = output.title || ""
 
       // Расчёт длительности
       const timingKey = `${sessionId}:${callId}`
@@ -1768,24 +2110,26 @@ export function createObserver(
       // Удаляем ключ из Map для экономии памяти
       toolStartTimes.delete(timingKey)
 
-      // Определение статуса
+      // Определение статуса. Empty output is a valid success (e.g. a silent
+      // command); denied/timeout must win over success; exit codes and
+      // metadata.success are the primary failure signals.
+      const exitCode = typeof metadata.exitCode === "number"
+        ? metadata.exitCode
+        : typeof metadata.exit_code === "number" ? metadata.exit_code : undefined
       let status: string
-      if (resultOutput && !metadata.error && !metadata.timeout) {
-        status = "success"
-      } else if (metadata.timeout) {
-        status = "timeout"
-      } else if (metadata.denied) {
+      if (metadata.denied === true || metadata.permissionDenied === true) {
         status = "denied"
-      } else {
+      } else if (metadata.timeout === true) {
+        status = "timeout"
+      } else if (metadata.error || metadata.success === false || (exitCode !== undefined && exitCode !== 0)) {
         status = "error"
+      } else {
+        status = "success"
       }
 
-      // Извлечение целевого файла из аргументов
-      let targetFile: string | null = null
-      if (args.filePath) targetFile = args.filePath as string
-      else if (args.file) targetFile = args.file as string
-      else if (args.path) targetFile = args.path as string
-      else if (args.target) targetFile = args.target as string
+      // Извлечение целевых файлов (включая multi-file patch)
+      const mutatingTargets = extractMutatingTargets(args)
+      const targetFile: string | null = mutatingTargets[0] ?? null
 
       // Обрезка аргументов до config.maxArgsPreviewChars
       const argsStr = JSON.stringify(args)
@@ -1816,14 +2160,17 @@ export function createObserver(
         result_size_bytes: resultSize,
       })
 
-      // Auto-Memory: обнаружение фактов из результатов инструментов
-      autoDetectFromToolResult(toolName, args, resultOutput, storage, log)
+      // Auto-Memory: обнаружение фактов из результатов инструментов (project-scoped)
+      const projectRoot = storage.getSession(sessionId)?.projectRoot || ""
+      void autoDetectFromToolResult(toolName, args, resultOutput, storage, log, projectRoot)
 
       // Verification commands become Evidence Ledger records automatically.
-      captureCommandEvidence(toolName, sessionId, args, resultTitle, resultOutput, status)
+      captureCommandEvidence(toolName, sessionId, args, resultOutput, status)
       inspectToolLoop(toolName, sessionId, safeArgsPreview, status)
-      if (status === "success" && targetFile && isMutatingFileTool(toolName)) {
-        recordSuccessfulEdit(toolName, sessionId, targetFile, args)
+      if (status === "success" && isMutatingFileTool(toolName)) {
+        for (const target of mutatingTargets) {
+          recordSuccessfulEdit(toolName, sessionId, target, args)
+        }
       }
 
       const durationStr = duration !== null ? `${duration}мс` : "N/A"
@@ -1845,19 +2192,28 @@ export function createObserver(
       const linesAdded = input.linesAdded || input.additions || 0
       const linesRemoved = input.linesRemoved || input.deletions || 0
       const sessionId = input.sessionID || input.sessionId || currentSessionId || "unknown"
-      const agentType = normalizeAgentType(input.agentType || input.agent)
+      const dedupeKey = `${sessionId}:${normalizeTrackedPath(filePath)}`
+      const lastWrite = recentFileEditWrites.get(dedupeKey)
+      if (lastWrite && Date.now() - lastWrite < FILE_EDIT_DEDUP_MS) {
+        log.debug(`file.edited (прямой хук): дубликат ${filePath} пропущен`)
+        return
+      }
+      rememberBounded(recentFileEditWrites, dedupeKey, Date.now())
       const normalizedEditType = normalizeEditType(editType)
       const timestamp = Date.now()
 
       let projectRoot = input.projectRoot || input.cwd || ""
-      if (!projectRoot && sessionId !== "unknown") {
+      let sessionAgent: unknown = undefined
+      if (sessionId !== "unknown") {
         try {
           const session = storage.getSession(sessionId)
           if (session?.projectRoot) {
-            projectRoot = session.projectRoot
+            projectRoot = projectRoot || session.projectRoot
           }
+          sessionAgent = session?.agentType
         } catch { /* игнорируем ошибки получения сессии */ }
       }
+      const agentType = normalizeAgentType(input.agentType || input.agent || sessionAgent)
 
       const language = detectLanguage(filePath)
       const diffHash = hashContent(diffText)
@@ -1886,11 +2242,10 @@ export function createObserver(
             `SELECT id, allowed_paths, forbidden_paths, violations FROM change_contracts
              WHERE project_root = ?1 AND status = 'active'`,
           ).all(projectRoot) as Array<{ id: string; allowed_paths: string; forbidden_paths: string; violations: string }>
-          const matches = (pattern: string, value: string) => pattern === "*" || value === pattern || value.startsWith(pattern.replace(/[*]$/, ""))
           for (const contract of activeContracts) {
             const allowed = JSON.parse(contract.allowed_paths || "[]") as string[]
             const forbidden = JSON.parse(contract.forbidden_paths || "[]") as string[]
-            if (forbidden.some((pattern) => matches(pattern, filePath)) || (allowed.length > 0 && !allowed.some((pattern) => matches(pattern, filePath)))) {
+            if (forbidden.some((pattern) => pathMatches(pattern, filePath, projectRoot)) || (allowed.length > 0 && !allowed.some((pattern) => pathMatches(pattern, filePath, projectRoot)))) {
               const previous = JSON.parse(contract.violations || "[]") as string[]
               const violations = Array.from(new Set([...previous, filePath]))
               storage.getDb().prepare(`UPDATE change_contracts SET status = 'violated', violations = ?1, updated_at = ?2 WHERE id = ?3`).run(JSON.stringify(violations), Date.now(), contract.id)
@@ -1902,8 +2257,15 @@ export function createObserver(
         }
       }
 
+      // Auto-Memory: отслеживание файлов сессии для авто-саммари
+      if (sessionId !== "unknown") {
+        const files = sessionFilesMap.get(sessionId) || new Set<string>()
+        files.add(filePath)
+        sessionFilesMap.set(sessionId, files)
+      }
+
       // Авто-детект фактов из файла
-      await autoDetectFromFile(storage, filePath, log)
+      await autoDetectFromFile(storage, filePath, log, projectRoot)
       crushDirty = true
 
       log.debug(`file.edited: ${filePath} (${language}, +${linesAdded}/-${linesRemoved})`)

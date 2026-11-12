@@ -225,6 +225,8 @@ export interface Decision {
   supersededBy: number | null;
   relatedFiles: string[] | null;
   tags: string[] | null;
+  /** Project scope: null/undefined = global (visible in every project). */
+  projectRoot?: string | null;
 }
 
 /** knowledge_nodes — узлы графа знаний */
@@ -236,6 +238,8 @@ export interface KnowledgeNode {
   metadata: KnowledgeNodeMetadata | null;
   createdAt: number;
   updatedAt: number;
+  /** Project scope: null/undefined = global (visible in every project). */
+  projectRoot?: string | null;
 }
 
 /** Метаданные узла графа знаний (хранятся как JSON в БД) */
@@ -260,6 +264,8 @@ export interface KnowledgeNodeMetadata {
   imports?: string[];
   test_coverage?: number;
   dependencies?: string[];
+  index_source?: string;
+  external?: boolean;
 }
 
 /** knowledge_edges — рёбра (связи) графа знаний */

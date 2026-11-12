@@ -59,8 +59,8 @@ export function createContextTool(
           // 1. Архитектура проекта — узлы типа module/concept
           // =====================================================================
           if (includes.includes("architecture")) {
-            const moduleNodes = storage.getNodesByType(NodeType.Module)
-            const conceptNodes = storage.getNodesByType(NodeType.Concept)
+            const moduleNodes = storage.getNodesByType(NodeType.Module, projectRoot)
+            const conceptNodes = storage.getNodesByType(NodeType.Concept, projectRoot)
             const archNodes = [...moduleNodes, ...conceptNodes]
 
             if (archNodes.length > 0) {
@@ -80,12 +80,12 @@ export function createContextTool(
           // 2. Конвенции — узлы с категориями PROJECT_RULES, NAMING, CONSTRAINTS, CONFIG_VALUES
           // =====================================================================
           if (includes.includes("conventions")) {
-            const ruleNodes = storage.getNodesByType(NodeType.Rule)
-            const patternNodes = storage.getNodesByType(NodeType.Pattern)
+            const ruleNodes = storage.getNodesByType(NodeType.Rule, projectRoot)
+            const patternNodes = storage.getNodesByType(NodeType.Pattern, projectRoot)
             const conventionNodes = [...ruleNodes, ...patternNodes]
 
             // Также ищем concept-узлы с соответствующими категориями в метаданных
-            const allConcepts = storage.getNodesByType(NodeType.Concept)
+            const allConcepts = storage.getNodesByType(NodeType.Concept, projectRoot)
             for (const c of allConcepts) {
               const meta = c.metadata as Record<string, unknown> | null
               const cat = meta?.category as string | undefined
@@ -114,15 +114,32 @@ export function createContextTool(
           // 3. Хотспоты — топ-5 проблемных файлов
           // =====================================================================
           if (includes.includes("hotspots")) {
-            // Используем кеш аналитики либо соберём данные напрямую
-            const cacheKey = "hotspots:30d:5"
-            const cached = storage.getCached(cacheKey) as {
+            // Кеш hotspots пишется с ключом hotspots:<project>:<timeframe>:<limit>.
+            // Читаем самый свежий валидный срез проекта за 30d независимо от limit.
+            const cachePrefix = `hotspots:${projectRoot}:30d:`
+            const cachedRows = storage.queryRows<{ cache_data: string; computed_at: number }>(
+              `SELECT cache_data, computed_at FROM analytics_cache
+               WHERE substr(cache_key, 1, ?2) = ?3
+                 AND (valid_until IS NULL OR valid_until > ?1)
+               ORDER BY computed_at DESC LIMIT 1`,
+              Date.now(),
+              cachePrefix.length,
+              cachePrefix,
+            )
+            let cached: {
               hotspots?: Array<{
                 filePath: string
                 score: number
                 explanation: string
               }>
             } | undefined
+            if (cachedRows.length > 0) {
+              try {
+                cached = JSON.parse(cachedRows[0].cache_data)
+              } catch {
+                cached = undefined
+              }
+            }
 
             if (cached && cached.hotspots && cached.hotspots.length > 0) {
               const lines: string[] = ["## Проблемные файлы (hotspots)"]
@@ -134,12 +151,12 @@ export function createContextTool(
               sections.push(lines.join("\n"))
             } else {
               // Fallback: собираем вручную — топ-5 файлов по частоте ошибок
-              const allFiles = storage.getDistinctFiles("30d")
+              const allFiles = storage.getDistinctFiles("30d", projectRoot)
               const fileScores: { path: string; score: number; errors: number; edits: number }[] = []
 
               for (const file of allFiles.slice(0, 100)) {
-                const errors = storage.getErrorCountForFile(file, "30d")
-                const edits = storage.getFileEditCount(file, "30d")
+                const errors = storage.getErrorCountForFile(file, "30d", projectRoot)
+                const edits = storage.getFileEditCount(file, "30d", projectRoot)
                 if (edits === 0) continue
                 const score = Math.min(Math.round((errors / edits) * 100), 100)
                 fileScores.push({ path: file, score, errors, edits })
@@ -163,11 +180,11 @@ export function createContextTool(
           // 4. Недавние изменения — последние 10 правок в любом timeframe
           // =====================================================================
           if (includes.includes("recent_changes")) {
-            const allFiles = storage.getDistinctFiles("7d")
+            const allFiles = storage.getDistinctFiles("7d", projectRoot)
             const fileChanges: { path: string; count: number }[] = []
 
             for (const file of allFiles.slice(0, 50)) {
-              const count = storage.getFileEditCount(file, "7d")
+              const count = storage.getFileEditCount(file, "7d", projectRoot)
               if (count > 0) fileChanges.push({ path: file, count })
             }
             fileChanges.sort((a, b) => b.count - a.count)
@@ -185,7 +202,7 @@ export function createContextTool(
           // 5. Архитектурные решения — последние 5 accepted
           // =====================================================================
           if (includes.includes("decisions")) {
-            const decisions = storage.getDecisions("accepted", 5)
+            const decisions = storage.getDecisions("accepted", 5, projectRoot)
 
             if (decisions.length > 0) {
               const lines: string[] = ["## Ключевые архитектурные решения"]
@@ -234,7 +251,7 @@ export function createContextTool(
             const focusLines: string[] = [`## Контекст для: ${focus}`]
 
             // Ищем узел знаний по focus
-            const matchedNodes = storage.searchNodes(focus, 5)
+            const matchedNodes = storage.searchNodes(focus, 5, projectRoot)
             if (matchedNodes.length > 0) {
               focusLines.push("### Связанные знания")
               for (const node of matchedNodes) {
@@ -246,7 +263,7 @@ export function createContextTool(
             }
 
             // Ищем файл в истории правок
-            const edits = storage.getFileEdits(focus, "30d")
+            const edits = storage.getFileEdits(focus, "30d", projectRoot)
             if (edits.length > 0) {
               focusLines.push(
                 `### История правок: ${edits.length} правок за 30 дней`,
@@ -260,7 +277,7 @@ export function createContextTool(
             }
 
             // Ошибки файла
-            const focusErrors = storage.getErrorCountForFile(focus, "30d")
+            const focusErrors = storage.getErrorCountForFile(focus, "30d", projectRoot)
             if (focusErrors > 0) {
               focusLines.push(`### Ошибки: ${focusErrors} за 30 дней`)
             }

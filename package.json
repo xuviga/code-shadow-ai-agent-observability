@@ -50,6 +50,7 @@
     "dev": "tsc --watch",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "typecheck:tui": "tsc -p tsconfig.tui.json",
     "postinstall": "node scripts/postinstall.js"
   }
 }

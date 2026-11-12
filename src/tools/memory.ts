@@ -160,6 +160,13 @@ export function createMemoryTools(
 ): Record<string, unknown> {
   const memoryLog = createLogger("memory-tools")
 
+  const resolveProjectRoot = (context: Record<string, unknown>, explicit?: string): string => {
+    if (explicit) return explicit
+    const sid = context.sessionID as string | undefined
+    const session = sid ? storage.getSession(sid) : undefined
+    return session?.projectRoot || (context.directory as string | undefined) || (context.cwd as string | undefined) || process.cwd()
+  }
+
   return {
 
     // =========================================================================
@@ -179,10 +186,12 @@ export function createMemoryTools(
           "NAMING",
         ]),
         content: tool.schema.string(),
+        project_root: tool.schema.string().optional(),
       },
 
       async execute(args, context) {
         try {
+          const projectRoot = resolveProjectRoot(context as Record<string, unknown>, args.project_root)
           const sanitized = sanitizeContent(args.content, config.secretPatterns)
           const tags = extractTags(args.content)
           const nodeType = CATEGORY_TO_NODE_TYPE[args.category] || NodeType.Rule
@@ -202,6 +211,7 @@ export function createMemoryTools(
             metadata: metadata as unknown as KnowledgeNodeMetadata,
             createdAt: Date.now(),
             updatedAt: Date.now(),
+            projectRoot,
           })
 
           memoryLog.info(
@@ -251,10 +261,12 @@ export function createMemoryTools(
           )
           .optional(),
         limit: tool.schema.number().optional(),
+        project_root: tool.schema.string().optional(),
       },
 
       async execute(args, context) {
         const limit = args.limit || 10
+        const projectRoot = resolveProjectRoot(context as Record<string, unknown>, args.project_root)
         const activeSources =
           args.sources && args.sources.length > 0
             ? args.sources
@@ -266,7 +278,7 @@ export function createMemoryTools(
           // a) "memory" — поиск по knowledge_nodes
           // -----------------------------------------------------------------
           if (activeSources.includes("memory")) {
-            const nodes = storage.searchNodes(args.query, limit)
+            const nodes = storage.searchNodes(args.query, limit, projectRoot)
 
             for (const node of nodes) {
               const meta = node.metadata as Record<string, unknown> | null
@@ -289,7 +301,7 @@ export function createMemoryTools(
           // b) "decisions" — поиск по таблице decisions
           // -----------------------------------------------------------------
           if (activeSources.includes("decisions")) {
-            const decisions = storage.getDecisions(undefined, 100)
+            const decisions = storage.getDecisions(undefined, 100, projectRoot)
 
             for (const d of decisions) {
               const titleScore = scoreRelevance(args.query, d.title)
@@ -322,7 +334,7 @@ export function createMemoryTools(
           // c) "file_history" — поиск по file_edits
           // -----------------------------------------------------------------
           if (activeSources.includes("file_history")) {
-            const allFiles = storage.getDistinctFiles()
+            const allFiles = storage.getDistinctFiles(undefined, projectRoot)
             const queryLower = args.query.toLowerCase()
 
             const matchingFiles = allFiles.filter(
@@ -335,8 +347,8 @@ export function createMemoryTools(
             )
 
             for (const filePath of matchingFiles.slice(0, limit)) {
-              const editCount = storage.getFileEditCount(filePath)
-              const edits = storage.getFileEdits(filePath, undefined)
+              const editCount = storage.getFileEditCount(filePath, undefined, projectRoot)
+              const edits = storage.getFileEdits(filePath, undefined, projectRoot)
               const lastEdit =
                 edits.length > 0 ? edits[0].timestamp : null
               const language =
@@ -376,6 +388,32 @@ export function createMemoryTools(
                 : ANALYTICS_CACHE_KEYS
 
             for (const cacheKey of keysToCheck.slice(0, 3)) {
+              if (cacheKey === "hotspots") {
+                const cachePrefix = `hotspots:${projectRoot}:`
+                const rows = storage.queryRows<{ cache_key: string; cache_data: string }>(
+                  `SELECT cache_key, cache_data FROM analytics_cache
+                   WHERE substr(cache_key, 1, ?1) = ?2
+                     AND (valid_until IS NULL OR valid_until > ?3)
+                   ORDER BY computed_at DESC LIMIT 3`,
+                  cachePrefix.length,
+                  cachePrefix,
+                  Date.now(),
+                )
+                for (const row of rows) {
+                  try {
+                    results.push({
+                      type: "analytics",
+                      cache_key: row.cache_key,
+                      data: JSON.parse(row.cache_data),
+                      relevance: scoreRelevance(args.query, row.cache_key),
+                    })
+                  } catch {
+                    // Пропускаем повреждённую запись кеша
+                  }
+                }
+                continue
+              }
+
               const cached = storage.getCached(cacheKey)
               if (cached) {
                 results.push({
@@ -466,10 +504,12 @@ export function createMemoryTools(
       args: {
         content: tool.schema.string(),
         surface_condition: tool.schema.string().optional(),
+        project_root: tool.schema.string().optional(),
       },
 
       async execute(args, context) {
         try {
+          const projectRoot = resolveProjectRoot(context as Record<string, unknown>, args.project_root)
           const sanitized = sanitizeContent(
             args.content,
             config.secretPatterns,
@@ -490,6 +530,7 @@ export function createMemoryTools(
             metadata: metadata as unknown as KnowledgeNodeMetadata,
             createdAt: Date.now(),
             updatedAt: Date.now(),
+            projectRoot,
           })
 
           memoryLog.info(

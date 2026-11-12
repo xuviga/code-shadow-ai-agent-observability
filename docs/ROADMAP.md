@@ -1,10 +1,18 @@
 # 🗺️ ROADMAP — Code Shadow
 
-**Последнее обновление**: 29 сентября 2026
-**Актуальная версия исходного baseline**: v0.1.2
+**Последнее обновление**: 12 ноября 2026
+**Актуальная версия исходного baseline**: v0.5.3
 
 > Стратегическая дорожная карта не является чек-листом уже реализованных
 > возможностей. Для текущей реализации см. [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+>
+> **Статусы ниже — исходный план, а не факт реализации.** На 12.11.2026
+> фактически реализован baseline v0.5.3: Observer, Memory, Analytics (9
+> режимов), Proactive Alerts (событие `tui.prompt.append` + `showToast`),
+> базовый `my_stats`, Auto-Memory, TUI-панель и CRUSH.md. Developer Wrapped
+> (тренды, ачивки, wrapped-отчёт), Team Dashboard, semantic search, graph UI и
+> cross-project analytics остаются планами; таблицы тарифов описывают целевой
+> продукт, а не текущую функциональность.
 
 ---
 
