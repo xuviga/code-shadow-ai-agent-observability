@@ -41,7 +41,7 @@ title/description; `file_history` — по путям; `analytics` читает 
 
 ### `code_shadow_memory_note`
 ```json
-{ "content": "Проверить миграцию 009 на старой БД", "surface_condition": "next session" }
+{ "content": "Проверить миграцию 011 на старой БД", "surface_condition": "next session" }
 ```
 Создаёт узел `note` с `status=active`. `surface_condition` сохраняется, но
 планировщика поверхностного показа пока нет.

@@ -6,6 +6,11 @@
 > **Code Shadow** — плагин для OpenCode: аналитика, предиктивная безопасность и коллективная память.  
 > **Версия документа:** 3.0.0 | **Дата:** 2026-07-18 | **Язык:** Русский  
 > **Целевая платформа:** Bun >= 1.1, OpenCode >= 1.0.0, SQLite (bun:sqlite — встроен, без внешних зависимостей)
+>
+> **Фактический baseline на 12.11.2026:** 16 типов событий observer, 16
+> инструментов, 9 режимов `code_shadow_analyze`, 19 таблиц + FTS5
+> `knowledge_nodes_fts`, миграции 001–011, 60 тестов. Строки ниже — исходный
+> план, а не текущий статус.
 
 ---
 
@@ -14,11 +19,11 @@
 | Фаза | Статус | Ключевой результат |
 |------|--------|-------------------|
 | 0. Project Setup | ✅ | package.json, tsconfig, 17 файлов |
-| 1. Observer Engine | ✅ | 12 хендлеров + file.edited прямой хук, bun:sqlite WAL |
-| 2. Memory Engine | ✅ | write/search/note — полная замена Magic Context |
-| 3. Analytics Engine | ✅ | analyze (8 режимов), context_inject, decide |
-| 4. Proactive Alerts | ✅ | Toast, /shadow команды |
-| 5. Developer Wrapped | ✅ | my_stats с трендами |
+| 1. Observer Engine | ✅ | 16 типов событий + legacy file.edited, bun:sqlite WAL |
+| 2. Memory Engine | ✅ | write/search/note — замена Magic Context (FTS5-поиск) |
+| 3. Analytics Engine | ✅ | analyze (9 режимов), context_inject, decide |
+| 4. Proactive Alerts | ✅ | showToast, /shadow через tui.prompt.append |
+| 5. Developer Wrapped | ⚠️ | my_stats (базовый; тренды/ачивки — план) |
 | 6. Auto-Memory | ✅ | 80+ правил, дедупликация 5 мин |
 | 7. TUI Panel | ✅ | Реактивная (5с polling), per-project |
 | 8. Autonomy | ✅ | CRUSH.md, агрессивные описания, авто-контекст |

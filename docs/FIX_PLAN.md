@@ -61,13 +61,13 @@
 - Лимиты: `batchQueue` ≤ 10000 с drop-oldest после неудачного flush; truncation текстов (`session_errors`, decisions, evidence, failure_memory, provenance, handoffs, developer_events JSON); `analytics_cache` с `valid_until=NULL` чистится по возрасту; `provenance_events` — по retention.
 - Периодическая очистка: `runCleanup` каждые 6 часов, не только на старте.
 - Observer state теперь per-instance (loop maps, session maps, `currentSessionId`, `crushDirty`, dedupe maps); `toolLoopMap` получил 10-минутный TTL и cap.
-- Осталось: `knowledge_nodes` natural-key UNIQUE (требует миграции с перепривязкой рёбер), `getFileEdits`/`getToolExecutionsForFile`/`getNodesByType` без LIMIT, LIKE-поиск с ведущим `%` (нужен FTS).
+- Закрыто в Follow-up 2/3: `knowledge_nodes` natural-key UNIQUE (миграция 010), LIMIT для `getFileEdits`/`getToolExecutionsForFile`/`getNodesByType`, FTS5-поиск (миграция 011).
 
 ## P3 — гигиена
 Статус: **закрыто (12.11.2026)**.
 - Удалён дубликат `src/tui-plugin.tsx` и мёртвый `src/install.ts`; корневая TUI-панель и `package-lock.json` синхронизированы на v0.5.3.
 - `scripts/postinstall.js` и runtime `ensureTuiPlugin` дополняют существующий `tui.json`, а не перезаписывают его; ошибки установки дают non-zero exit code.
-- README обновлён: 19 таблиц, 16 инструментов, миграции 001–009, один TUI-файл, актуальные команды `/shadow`.
+- README обновлён: 19 таблиц + FTS5, 16 инструментов, миграции 001–011, один TUI-файл, актуальные команды `/shadow`.
 - `ARCHITECTURE.md`, `DATA_MODEL.md`, `TOOLS_API.md` переписаны под текущий код; `ROADMAP.md`, `IMPLEMENTATION_STATUS.md`, `CHANGELOG.md` обновлены.
 - Добавлены тесты: `path-match`, `import-graph`, `agent-tools`.
 
@@ -76,7 +76,7 @@
 - Добавлен `tests/plugin-smoke.test.ts`: реальная точка входа `CodeShadow` с mock OpenCode client, изолированный temp home, SDK-shaped события, проверка БД/CRUSH/tui.json и `dispose`.
 - `dispose` теперь возвращается плагином, снимает интервалы и process-listeners.
 - `resolvePath` и логгер используют env-home и ленивую инициализацию — тестовая/portable изоляция работает.
-- Не закрыто: запуск против реального OpenCode host (нужен установленный хост и интерактивная сессия); `knowledge_nodes` UNIQUE/FTS/LIMIT из P2.
+- Выполнен ручной интеграционный прогон на OpenCode 1.18.30 (serve + session lifecycle + flush); автоматического host harness в CI нет. `knowledge_nodes` UNIQUE/FTS/LIMIT закрыты в Follow-up 2/3.
 
 ## Follow-up — закрыто 12.11.2026 (после первичного аудита)
 

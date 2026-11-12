@@ -100,8 +100,9 @@ TUI event-контракт, миграцию natural-key uniqueness и FTS/LIKE-
 ## Известные границы v0.5.3
 
 - Проект тестирует Storage/Observer на реальной SQLite-базе, но не содержит
-  полноценного OpenCode host harness; поэтому совместимость с конкретной версией
-  OpenCode подтверждается отдельным smoke-тестом.
+  полноценного автоматического OpenCode host harness; совместимость
+  подтверждается smoke-тестом и отдельным ручным прогоном на OpenCode 1.18.30
+  (`serve` + session lifecycle).
 - TUI-панель существует в одном экземпляре (`tui-plugin.tsx` в корне); `src/tui-plugin.tsx`
   удалён, установщики создают/дополняют `~/.config/opencode/tui.json`. Панель
   проверяется отдельной командой `npm run typecheck:tui`.

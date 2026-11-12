@@ -1,6 +1,6 @@
 # Модель данных Code Shadow
 
-> Актуально на v0.5.3 (12.11.2026). Источник правды — `src/migrations/001…009`
+> Актуально на v0.5.3 (12.11.2026). Источник правды — `src/migrations/001…011`
 > и `src/types.ts`. SQLite-файл по умолчанию:
 > `~/.config/opencode/shadow/data.db` (WAL).
 
@@ -8,8 +8,9 @@
 
 - `bun:sqlite`, `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
 - Версия схемы: `schema_version(version INTEGER PRIMARY KEY, applied_at, description)`.
-- `runMigrations()` берёт `MAX(version)` и применяет недостающие миграции;
-  каждая — в собственной транзакции.
+- `runMigrations()` перечитывает `MAX(version)` перед каждым шагом (защита от
+  параллельного применения), выполняет миграции по одной в собственной
+  транзакции и бросает ошибку (fail-fast) вместо работы на полусхеме.
 
 | Версия | Файл | Назначение |
 |---|---|---|

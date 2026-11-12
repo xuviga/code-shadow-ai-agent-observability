@@ -59,7 +59,7 @@ OpenCode event/hook
    умолчанию — в `src/config.ts`. `~` разворачивается через env (`USERPROFILE`/
    `HOME`) с fallback на `os.homedir()`.
 2. `new StorageEngine(config)`: mkdir, `bun:sqlite`, `journal_mode=WAL`,
-   `busy_timeout=5000`, `foreign_keys=ON`, миграции 001–009.
+   `busy_timeout=5000`, `foreign_keys=ON`, миграции 001–011.
 3. `runCleanup()` на старте и далее каждые 6 часов.
 4. Интервалы: `flushBatch` каждые 5 с, CRUSH refresh каждые 10 с (по dirty-флагу
    или раз в 3 минуты).
@@ -87,6 +87,8 @@ OpenCode event/hook
 | `event: todo.updated` | `todos` + зеркалирование в `agent_tasks/task_steps` |
 | `event: lsp.client.diagnostics` | реальный payload не содержит diagnostics; `lsp.updated` обрабатывается при наличии массива |
 | `event: session.updated/deleted` | project root для пустой сессии / статус `deleted` |
+| `event: tui.prompt.append` | команды `/shadow`; тост через `client.tui.showToast` |
+| `experimental.session.compacting` | briefing по `sessionID` и project scope |
 
 Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для старых хостов, но
 основной путь — `event`.
@@ -100,16 +102,21 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
 - **Failure-loop**: одинаковый tool+args с ошибкой 3 раза → `tool_rejected`
   (`agent_loop_detected`); TTL 10 минут, cap 5000 ключей.
 - **Change Contract**: пути проверяются `pathMatches` (glob, Windows, project
-  root). Preflight warning, hard deny в `permission.ask`, post-edit фиксация
-  violations. Пустой `check` не считается успехом; `close` запрещён для
-  `violated`.
+  root, `./`/`..` нормализуются). Preflight warning, hard deny в
+  `permission.ask`, post-edit фиксация violations. Пустой `check` не считается
+  успехом; `close` запрещён для `violated`.
+- **Mutating tools**: `write`, `edit`, `patch`, `apply_patch`, `multi_edit`;
+  цели извлекаются из `filePath`/`files` и заголовков patch text.
 - **Definition of Done**: шаги завершены, есть verified evidence, нет открытых
-  failures/контрактов/противоречий. `update status=completed` проходит ту же
-  проверку, что `complete`.
+  failures/контрактов/противоречий; failures/evidence ищутся по `task_id` без
+  LIKE/LIMIT. `update status=completed` проходит ту же проверку, что `complete`.
+- **Verification evidence**: только shell/явная команда, без `echo/grep`-обманок
+  и `|| true`; failure-маркеры в успешном выводе переводят evidence в `failed`.
 
 ## 7. Хранение
 
-- 19 таблиц; миграции 001–009, версия в `schema_version`.
+- 19 таблиц + FTS5-таблица `knowledge_nodes_fts`; миграции 001–011, версия в
+  `schema_version`.
 - Batch-очередь: `batchSize` (default 10), flush каждые 5 с; при ошибке batch
   выполняется построчная запись, «отравленные» строки логируются, очередь не
   блокируется; cap 10 000 с drop-oldest.
@@ -117,7 +124,10 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
   project+started, decisions project/status+time, `knowledge_edges` UNIQUE.
 - Retention: сырые события — `retentionDays`; сессии — `sessionRetentionDays`
   (удаляются `idle/error/deleted/compacted` вместе с todos/errors); stale
-  analytics_cache и provenance также чистятся.
+  analytics_cache и provenance также чистятся; терминальные agent-native
+  записи — по `sessionRetentionDays`, открытые/активные не удаляются.
+- Лимиты: `getFileEdits` 5000, `getNodesByType` 1000,
+  `getToolExecutionsForFile` 1000 (project-scoped).
 - Текстовые поля ограничены (ошибки 4k/16k, decisions 8k, evidence 8k,
   failure 4k, handoff 4k/32k JSON, dev event metadata 16k JSON).
 
@@ -131,13 +141,17 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
 `getErrorTotalForEditedFiles*`, `getTopFilesByEdits`, `getToolUsageCounts`,
 `getFileMetrics`, `getHotspotMetrics`, `getErrorCountsByFile`) — без N+1 по
 файлам. `dependency_graph` лениво индексирует импорты (`import-graph.ts`).
-Память и ADR можно ограничить `project_root` (миграция 008, NULL = global).
+Агрегаты, hotspots-кеш, file history и TUI-панель фильтруются по
+`project_root`; память и ADR — с миграции 008 (NULL = global).
+Поиск памяти: FTS5 + bm25 (name/path/metadata, префиксы токенов, буст точного
+имени) и LIKE-fallback для подстрочных совпадений.
 
 ## 9. TUI
 
-- Серверные хуки (`src/tui.ts`): риск-тост перед `edit/write`, команды
-  `/shadow hotspots|predict|stats|health|tui`, briefing в
-  `experimental.session.compacting`.
+- Серверные хуки (`src/tui.ts`): риск-тост перед `edit/write` через
+  `client.tui.showToast`, команды `/shadow hotspots|predict|stats|health|tui`
+  из события `tui.prompt.append`, briefing в `experimental.session.compacting`
+  (project из `sessionID`).
 - Сайдбар (`tui-plugin.tsx`): read-only БД, слот `sidebar_content`, обновление
   по событиям с debounce и polling 5 с. Устанавливается postinstall/рантаймом
   в `~/.config/opencode/plugins/code-shadow/` и мержится в `tui.json`.
@@ -148,5 +162,6 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
   аргументы/диффы обрезаются до санитизации только по размеру.
 - `provenance` помечает trust level и эвристически детектит prompt injection.
 - Ограничения: аналитика эвристическая (не ML), LSP-диагностика зависит от
-  payload хоста, `knowledge_nodes` не имеет natural-key UNIQUE, LIKE-поиск без
-  FTS, host harness ограничен smoke-тестом `tests/plugin-smoke.test.ts`.
+  payload хоста, FTS — токены/префиксы (не семантический поиск), host harness
+  в CI ограничен smoke-тестом `tests/plugin-smoke.test.ts`; отдельный ручной
+  прогон на OpenCode 1.18.30 выполнен (serve + session lifecycle).

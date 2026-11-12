@@ -568,7 +568,7 @@ task:create → context_router → change_contract:create
 |-----------|----------|
 | `code_shadow_analyze` | Единый тулз: 9 режимов (hotspots, predict_change, file_history, team_pulse, my_stats, dependency_graph, knowledge_search, decisions_list, code_errors) |
 | `code_shadow_memory_write` | Запись фактов о проекте (замена ctx_memory) |
-| `code_shadow_memory_search` | Поиск по памяти, графу знаний, истории, аналитике (замена ctx_search) |
+| `code_shadow_memory_search` | Поиск по памяти (FTS5 + bm25, LIKE-fallback), графу знаний, истории, аналитике (замена ctx_search) |
 | `code_shadow_memory_note` | Заметки с опциональным surface_condition (замена ctx_note) |
 | `code_shadow_context_inject` | Внедрение контекста проекта в сессию |
 | `code_shadow_decide` | Запись архитектурных решений (ADR) |
@@ -920,7 +920,7 @@ Observer: session.compacted
 
 | Фаза | Статус |
 |------|--------|
-| 1. Observer Engine | ✅ 12 хендлеров, file.edited прямой хук |
+| 1. Observer Engine | ✅ 16 типов событий, legacy file.edited хук |
 | 2. Memory Engine | ✅ Полная замена Magic Context |
 | 3. Analytics Engine | ✅ 9 режимов анализа |
 | 4. Proactive Alerts | ✅ Toast + /shadow |
@@ -936,7 +936,7 @@ Observer: session.compacted
 
 - [x] Базовая структура плагина (`index.ts`, `package.json`, `tsconfig.json`)
 - [x] Подключение к OpenCode Plugin SDK (`@opencode-ai/plugin`)
-- [x] Схема БД: 19 таблиц после миграции v10 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`)
+- [x] Схема БД: 19 таблиц после миграции v11 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`) + FTS5-таблица `knowledge_nodes_fts`
 - [x] Подписка на событие `file.edited` (прямой именованный хук + авто-детект фактов)
 - [x] Подписка на событие `session.created` / `session.idle` / `session.error` / `session.compacted`
 - [x] Подписка на событие `tool.execute.before` / `tool.execute.after`
@@ -949,7 +949,7 @@ Observer: session.compacted
 #### Фаза 2 — Memory Engine ✅
 
 - [x] `code_shadow_memory_write` — запись фактов и ADR-решений
-- [x] `code_shadow_memory_search` — поиск по памяти, графу знаний и истории
+- [x] `code_shadow_memory_search` — FTS5 + bm25 по памяти (name/path/metadata) с LIKE-fallback, плюс граф знаний и история
 - [x] `code_shadow_memory_note` — создание заметок (чтение/закрытие — план)
 - [x] `code_shadow_context_inject` — инъекция контекста в сессию
 - [x] Полная замена Magic Context (память, поиск, заметки, инъекция)
