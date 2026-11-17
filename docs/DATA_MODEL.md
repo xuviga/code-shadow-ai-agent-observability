@@ -1,6 +1,6 @@
 # Модель данных Code Shadow
 
-> Актуально на v0.5.3 (12.11.2026). Источник правды — `src/migrations/001…011`
+> Актуально на v0.5.3 (17.11.2026). Источник правды — `src/migrations/001…012`
 > и `src/types.ts`. SQLite-файл по умолчанию:
 > `~/.config/opencode/shadow/data.db` (WAL).
 
@@ -25,6 +25,7 @@
 | 009 | `009_analytics_indexes.ts` | составные индексы + UNIQUE `knowledge_edges` |
 | 010 | `010_knowledge_node_natural_key.ts` | natural-key UNIQUE `knowledge_nodes` + перепривязка рёбер |
 | 011 | `011_knowledge_fts.ts` | FTS5-индекс `knowledge_nodes_fts` + триггеры |
+| 012 | `012_event_taxonomy.ts` | `tool_warning` и `turn_completed`; разделение блокирующих и advisory-событий |
 
 ## 2. Сырая телеметрия
 
@@ -60,10 +61,26 @@
 
 ### developer_events
 `id` PK AI, `event_type` (CHECK: `session_started|session_start|session_end|
-session_completed|command_used|human_fix|manual_edit|revert|todo_completed|
-lsp_diagnostic|lsp_diagnostic_summary|file_focus|tool_rejected`), `session_id`,
-`file_path`, `metadata` JSON, `timestamp`.
+session_completed|turn_completed|command_used|human_fix|manual_edit|revert|
+todo_completed|lsp_diagnostic|lsp_diagnostic_summary|file_focus|tool_rejected|
+tool_warning`), `session_id`, `file_path`, `metadata` JSON, `timestamp`.
 Индексы: `event_type`, `timestamp`, `(event_type,timestamp)`.
+
+Семантика событий:
+- `turn_completed` — завершён один ход/idle; пишется на каждый `session.idle`,
+  содержит `metadata.turn_index`, `duration_ms` (длительность хода),
+  `session_duration_ms`, дельты `files_changed/tools_used/errors` за ход,
+  `*_total` кумулятивные значения, а также `interrupted`/`interrupt_reason`.
+- `session_completed` — legacy-событие старых версий; на idle больше не
+  пишется. Терминальные состояния сессии фиксируются `session_end`
+  (`reason: compacted|deleted`).
+- `tool_rejected` — блокирующее событие (`metadata.blocking=true`,
+  `severity=error|critical`): `successful_edit_loop_blocked`,
+  `change_contract_permission_denied`.
+- `tool_warning` — non-blocking advisory (`metadata.blocking=false`,
+  `severity=warning`): `successful_edit_loop_warning`,
+  `change_contract_preflight`, `agent_loop_detected`. Такие события не должны
+  попадать в KPI отказов.
 
 ### todos
 `todo_id` PK, `session_id` FK→sessions, `title`, `status`

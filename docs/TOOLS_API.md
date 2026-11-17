@@ -93,6 +93,9 @@ title/description; `file_history` — по путям; `analytics` читает 
 ### `code_shadow_task`
 Actions: `create | list | get | update | add_step | complete_step | done_check | complete | block`.
 - `create` требует `title`, `goal`; статус по умолчанию `active`, priority 50.
+- Auto-Task из `chat.message` создаёт одну задачу на сессию и один шаг
+  «Выполнить запрос пользователя»; остальные шаги агент добавляет сам.
+  Брошенные auto-задачи старше 24 часов отменяются cleanup-интервалом.
 - `add_step` требует `step_title`; позиция = число шагов.
 - `complete_step` требует `step_id`; `blocked_by` при отсутствии сохраняется.
 - `done_check` — read-only Definition of Done.
@@ -144,8 +147,11 @@ failures/contracts. `list` показывает только `open` (limit 20).
 Actions: `behavior | quality | risk`.
 - `behavior` — calls/errors/avg duration по инструментам + сессии.
 - `quality` — verified/unverified evidence, open failures, violated contracts,
-  contradictions.
+  contradictions, `guard_warnings` (`tool_warning`) и `blocking_rejections`
+  (только `tool_rejected` с `blocking=true` или блокирующим reason).
 - `risk` — отдельный score 0..1 и level (`low/medium/high`) по этим сигналам.
+  `tool_warning` не считается отказом; для rejection-rate используйте
+  `blocking_rejections`, а не общий `tool_rejected`.
 
 ### `code_shadow_contradiction`
 Actions: `record | list | resolve | accept`.

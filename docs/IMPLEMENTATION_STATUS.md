@@ -1,6 +1,6 @@
 # Code Shadow — фактический статус реализации
 
-Документ отражает состояние исходного кода на 2026-09-30 и является источником
+Документ отражает состояние исходного кода на 2026-11-17 и является источником
 правды для текущего `v0.5.3`. Проект — локальный плагин OpenCode; он не является
 облачным сервисом и не требует API-ключей.
 
@@ -12,10 +12,12 @@
   developer events, todo-изменения, LSP-диагностику и автоматически найденные
   факты.
 - Storage работает на `bun:sqlite`, включает WAL, batch-запись и миграции до
-  версии 11. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
+  версии 12. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
   плагин на полусхеме. Миграция 010 закрепляет natural-key уникальность
   `knowledge_nodes` (file — по `path`, остальные — по `name`, в рамках проекта),
-  миграция 011 добавляет FTS5-индекс и триггеры синхронизации памяти.
+  миграция 011 добавляет FTS5-индекс и триггеры синхронизации памяти,
+  миграция 012 разделяет `tool_rejected` (блокировка) и `tool_warning`
+  (совет) и вводит `turn_completed` для завершения хода.
 - Аналитика предоставляет 9 режимов: `hotspots`, `predict_change`,
   `file_history`, `team_pulse`, `my_stats`, `dependency_graph`,
   `knowledge_search`, `decisions_list`, `code_errors`.
@@ -59,6 +61,16 @@
   используют реальные внешние ключи и таблицы.
 - Базовый тестовый контур находится в `tests/` и покрывает миграции, batch-запись,
   session/LSP/todo-события, нормализацию входных данных и поиск памяти.
+- OpenCode 2 загружает `src/v2.ts` (`exports["."]`): адаптер регистрирует те же
+  16 инструментов и guardrail-хуки, подписывается на 14 V2-событий и переводит
+  их в V1-контракты. `session.step.ended.files` даёт `file.edited`,
+  `execution.succeeded/interrupted` завершают ход через `session.idle`.
+  Ограничения V2 (нет todo/LSP, `tui.command.execute` — только частичная замена
+  `command.executed`, приближение message-метрик)
+  описаны в [V2_COMPATIBILITY.md](V2_COMPATIBILITY.md).
+- Один блок автономных правил пишется в `~/.config/opencode/CRUSH.md`
+  (OpenCode 1) и `~/.config/opencode/AGENTS.md` (OpenCode 2); пользовательский
+  текст вне маркеров сохраняется, повторный refresh не дублирует блок.
 
 ## Фактическая схема SQLite
 
@@ -88,11 +100,12 @@ bun test
 
 `npm run typecheck` проверяет TypeScript без генерации файлов, а
 `npm run typecheck:tui` — отдельную TUI-панель через `tsconfig.tui.json` и
-ambient-шимы хоста. `bun test` запускает 60 тестов, включая entrypoint
-smoke-тест плагина, regression-тесты на реальные payload'ы SDK 1.18.x,
+ambient-шимы хоста. `bun test` запускает **114 тестов** (11 файлов), включая
+entrypoint smoke-тест плагина, V2 setup/event-тесты, regression-тесты на
+реальные payload'ы SDK 1.18.x, V2-трансляцию событий, TUI event-контракт,
 glob-контракты с `./`/`..`, индексатор импортов, project-scope агрегаты,
 patch/apply_patch guard, DoD по `task_id`, retention agent-native таблиц,
-TUI event-контракт, миграцию natural-key uniqueness и FTS/LIKE-поиск памяти. Для интеграционной
+миграцию natural-key uniqueness и FTS/LIKE-поиск памяти. Для интеграционной
 проверки в реальном OpenCode дополнительно нужно установить плагин в тестовый
 проект и проверить реальные события `session.created`, `file.edited`,
 `tool.execute.*`, `lsp.client.diagnostics` и TUI-команды `/shadow`.
@@ -104,8 +117,16 @@ TUI event-контракт, миграцию natural-key uniqueness и FTS/LIKE-
   подтверждается smoke-тестом и отдельным ручным прогоном на OpenCode 1.18.30
   (`serve` + session lifecycle).
 - TUI-панель существует в одном экземпляре (`tui-plugin.tsx` в корне); `src/tui-plugin.tsx`
-  удалён, установщики создают/дополняют `~/.config/opencode/tui.json`. Панель
-  проверяется отдельной командой `npm run typecheck:tui`.
+  удалён, установщики копируют `tui-plugin.tsx` и `src/tui-v2.ts` и создают/дополняют
+  `~/.config/opencode/tui.json` единственной записью `./plugins/code-shadow/tui-v2.ts`.
+  Панель проверяется отдельной командой `npm run typecheck:tui`.
+- V2-адаптер не воспроизводит всё поведение V1-хоста: нет `todo.updated` и
+  LSP-событий; `tui.command.execute` даёт частичную замену `command.executed`
+  только для TUI-команд, `message.updated`/`message.part.updated` аппроксимируются
+  буфером `session.step.ended`. Синхронизация OpenCode todos с Task Graph и LSP-захват
+  в OpenCode 2 отключены, `/shadow` доступен через `tui.prompt.append`.
+- AGENTS.md и CRUSH.md обновляются одним и тем же блоком; если пользователь удалил
+  маркеры, блок будет добавлен заново (пользовательский текст сохраняется).
 - Аналитика локальная и эвристическая: score не является ML-моделью и требует
   накопленной истории событий.
 - Provenance детектирует распространённые признаки prompt injection эвристикой;

@@ -4,8 +4,39 @@ All notable changes to Code Shadow are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- OpenCode 2 telemetry through `src/v2.ts`: 13 subscribed events, including
+  `session.execution.succeeded` / `session.execution.interrupted` as turn
+  completion and `session.step.ended.files` mapped to `file.edited` with
+  per-session attribution; `V2StepUsageBuffer` emits one summed
+  `message.updated` before idle, and event locations resolve `project_root`.
+- `AGENTS.md` global instructions for OpenCode 2: the same
+  `CODE_SHADOW_START/END` block is written to `~/.config/opencode/AGENTS.md`
+  and `~/.config/opencode/CRUSH.md`, preserving user text outside the markers
+  and replacing the block instead of appending a duplicate.
+- `docs/V2_COMPATIBILITY.md` with the event map, V2 gaps (todo/LSP/command),
+  packaging and TUI install notes.
+- A `typecheck:test` CI step after the main typecheck.
+
 ### Fixed
 
+- Separates blocking tool rejections from warnings (migration 012, `severity`)
+  and records turn completion as `turn_completed`, so a turn and a session
+  completion are distinguishable in analytics.
+- Interrupted V2 turns now carry `metadata.interrupted=true` and
+  `interrupt_reason`; the marker is preserved even when a normal `session.idle`
+  arrives first.
+- V2 step/watcher paths and `tool_executions.target_file` are normalized to
+  one absolute, forward-slash form (`src/project-path.ts`), so file edits and
+  tool calls can be joined.
+- `turn_completed` now records per-turn duration and per-turn deltas instead of
+  repeating cumulative session counts.
+- `tui.command.execute` is translated to `command.executed` (partial V2
+  replacement for TUI commands).
+- `package-lock.json` is no longer ignored and CI uses `npm ci
+  --ignore-scripts`; `npm run doctor` checks schema, AGENTS/CRUSH markers,
+  TUI entry, package exports and recent V2 telemetry.
 - Aligns the observer with the real `@opencode-ai/plugin` 1.18.x payloads:
   `session.created` agent from `chat.message`, `session.compacted` keeps the
   session id, real error names, `message.updated` token/message metrics,
@@ -51,6 +82,17 @@ All notable changes to Code Shadow are documented here.
 
 ### Changed
 
+- Package exports now expose every entry point: `.` → `./src/v2.ts`,
+  `./v1` → `./src/index.ts`, `./v2` → `./src/v2.ts`, `./tui` →
+  `./src/tui-v2.ts`, `./tui-v1` → `./tui-plugin.tsx`.
+  `@opencode/plugin` moved from dependencies to peerDependencies and is also a
+  devDependency; the package has no runtime dependencies.
+- Postinstall copies both `tui-plugin.tsx` and `src/tui-v2.ts`, writes the
+  `./plugins/code-shadow/tui-v2.ts` entry, removes the legacy
+  `tui-plugin.tsx` entry from `tui.json`, and leaves invalid JSON untouched.
+- The V2 TUI adapter loads the panel from any of `./tui-plugin.js`,
+  `../tui-plugin.js`, `./tui-plugin.tsx`, `../tui-plugin.tsx`, so installed and
+  repository layouts both work.
 - Removes the unused `src/install.ts` and duplicate `src/tui-plugin.tsx`.
 - Postinstall and runtime setup now merge the TUI entry into an existing
   `~/.config/opencode/tui.json` and report failures with a non-zero exit code.

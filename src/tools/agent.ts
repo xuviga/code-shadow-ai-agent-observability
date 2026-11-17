@@ -369,13 +369,21 @@ export function createAgentTools(
           (SELECT COUNT(*) FROM evidence_records WHERE project_root = ?1 AND status IN ('observed','unknown')) AS unverified_evidence,
           (SELECT COUNT(*) FROM failure_memory WHERE project_root = ?1 AND status = 'open') AS open_failures,
           (SELECT COUNT(*) FROM change_contracts WHERE project_root = ?1 AND status = 'violated') AS violated_contracts,
-          (SELECT COUNT(*) FROM contradiction_records WHERE project_root = ?1 AND status = 'open') AS contradictions`, root)
+          (SELECT COUNT(*) FROM contradiction_records WHERE project_root = ?1 AND status = 'open') AS contradictions,
+          (SELECT COUNT(*) FROM developer_events e JOIN sessions s ON s.id = e.session_id
+            WHERE s.project_root = ?1 AND e.event_type = 'tool_warning') AS guard_warnings,
+          (SELECT COUNT(*) FROM developer_events e JOIN sessions s ON s.id = e.session_id
+            WHERE s.project_root = ?1 AND e.event_type = 'tool_rejected'
+              AND (COALESCE(json_extract(e.metadata, '$.blocking'), 0) = 1
+                OR json_extract(e.metadata, '$.reason') IN ('successful_edit_loop_blocked','change_contract_permission_denied'))) AS blocking_rejections`, root)
         const row = quality[0] as Record<string, number> | undefined
         const warnings: string[] = []
         if ((row?.unverified_evidence || 0) > (row?.verified_evidence || 0)) warnings.push("observed evidence преобладает над verified")
         if ((row?.open_failures || 0) > 0) warnings.push("есть открытые failure memories")
         if ((row?.violated_contracts || 0) > 0) warnings.push("есть нарушенные change contracts")
         if ((row?.contradictions || 0) > 0) warnings.push("есть неразрешённые противоречия")
+        if ((row?.blocking_rejections || 0) > 0) warnings.push("есть блокирующие tool_rejected события")
+        if ((row?.guard_warnings || 0) > 0) warnings.push("есть non-blocking guard warnings (не считаются отказами)")
         if (args.action === "risk") {
           const verified = row?.verified_evidence || 0
           const unverified = row?.unverified_evidence || 0

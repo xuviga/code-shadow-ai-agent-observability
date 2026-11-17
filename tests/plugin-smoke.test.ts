@@ -93,6 +93,7 @@ describe("plugin entrypoint smoke", () => {
       expect(edits.cnt).toBe(1)
       expect(tools.cnt).toBe(1)
       expect(existsSync(join(home, ".config", "opencode", "CRUSH.md"))).toBe(true)
+      expect(existsSync(join(home, ".config", "opencode", "AGENTS.md"))).toBe(true)
       expect(existsSync(join(home, ".config", "opencode", "tui.json"))).toBe(true)
       expect(toastCalls.length).toBeGreaterThanOrEqual(0)
     } finally {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { StorageEngine } from "../src/storage"
 import { migrateV010KnowledgeNodeNaturalKey } from "../src/migrations/010_knowledge_node_natural_key"
-import { AgentType, EditType, SessionStatus } from "../src/types"
+import { AgentType, EditType, ErrorType, EvidenceStatus, NodeType, SessionStatus, TaskStatus, TaskStepStatus } from "../src/types"
 
 const databases: Array<{ storage: StorageEngine; directory: string }> = []
 
@@ -51,7 +51,7 @@ describe("StorageEngine", () => {
     const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'todos'").get()
     const errorFileIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_errors_file'").get()
 
-    expect(version.version).toBe(11)
+    expect(version.version).toBe(12)
     expect(table).toBeTruthy()
     expect(errorFileIndex).toBeTruthy()
     const uniqueEdgeIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ke_unique'").get()
@@ -196,8 +196,8 @@ describe("StorageEngine", () => {
     const check = storage.checkChangeContract(contract.id, ["src/index.ts", ".env"])
 
     expect(storage.getTask(task.id)?.title).toBe("Repair observer")
-    expect(storage.getTaskStep(step.id)?.status).toBe("completed")
-    expect(storage.getEvidence(evidence.id)?.status).toBe("verified")
+    expect(storage.getTaskStep(step.id)?.status).toBe(TaskStepStatus.Completed)
+    expect(storage.getEvidence(evidence.id)?.status).toBe(EvidenceStatus.Verified)
     expect(storage.getFailure(failure.id)?.status).toBe("resolved")
     expect(check.allowed).toBe(false)
     expect(check.violations).toEqual([".env"])
@@ -265,11 +265,11 @@ describe("StorageEngine", () => {
     edit("C:/project-a", "src/a.ts", "session-a")
     edit("C:/project-b", "src/b.ts", "session-b")
     storage.insertError({
-      sessionId: "session-a", errorType: "unknown", errorMessage: "A error",
+      sessionId: "session-a", errorType: ErrorType.Unknown, errorStack: null, errorMessage: "A error",
       contextFile: "src/a.ts", contextTool: null, timestamp: now, resolved: false,
     })
     storage.insertError({
-      sessionId: "session-b", errorType: "unknown", errorMessage: "B error",
+      sessionId: "session-b", errorType: ErrorType.Unknown, errorStack: null, errorMessage: "B error",
       contextFile: "src/b.ts", contextTool: null, timestamp: now, resolved: false,
     })
 
@@ -444,7 +444,7 @@ describe("StorageEngine", () => {
     expect(patched?.title).toBe("Original")
     expect(patched?.goal).toBe("Keep goal")
     expect(patched?.priority).toBe(10)
-    expect(patched?.status).toBe("active")
+    expect(patched?.status).toBe(TaskStatus.Active)
 
     storage.updateTask(task.id, { status: "completed" as never })
     expect(storage.getTask(task.id)?.completedAt).toBeTruthy()
@@ -462,7 +462,7 @@ describe("StorageEngine", () => {
       filesChangedCount: 0, toolsUsedCount: 0, errorsCount: 1,
       projectRoot: "C:/project", messageCount: 0, totalTokensUsed: 0, compactedFrom: null,
     } as never)
-    storage.insertError({ sessionId, errorType: "unknown", errorMessage: "old error", contextFile: null, contextTool: null, timestamp: startedAt, resolved: false })
+    storage.insertError({ sessionId, errorType: ErrorType.Unknown, errorStack: null, errorMessage: "old error", contextFile: null, contextTool: null, timestamp: startedAt, resolved: false })
     storage.getDb().prepare(
       "INSERT INTO todos (todo_id, session_id, title, status, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?5)",
     ).run("expired-todo", sessionId, "Old todo", "pending", startedAt)
@@ -546,8 +546,8 @@ describe("StorageEngine", () => {
     insertSession("error-a")
     insertSession("error-b")
     insertSession("edit-only")
-    storage.insertError({ sessionId: "error-a", errorType: "unknown", errorMessage: "a", contextFile: "src/broken.ts", contextTool: null, timestamp: now, resolved: false })
-    storage.insertError({ sessionId: "error-b", errorType: "unknown", errorMessage: "b", contextFile: "src/broken.ts", contextTool: null, timestamp: now, resolved: false })
+    storage.insertError({ sessionId: "error-a", errorType: ErrorType.Unknown, errorStack: null, errorMessage: "a", contextFile: "src/broken.ts", contextTool: null, timestamp: now, resolved: false })
+    storage.insertError({ sessionId: "error-b", errorType: ErrorType.Unknown, errorStack: null, errorMessage: "b", contextFile: "src/broken.ts", contextTool: null, timestamp: now, resolved: false })
     storage.insertFileEdit({
       filePath: "src/broken.ts", sessionId: "edit-only", agentType: AgentType.Build, editType: EditType.Update,
       diffPreview: null, linesAdded: 1, linesRemoved: 0, timestamp: now,
@@ -560,9 +560,9 @@ describe("StorageEngine", () => {
   test("scopes memory nodes and decisions by project while keeping global rows visible", () => {
     const storage = createStorage()
     const now = Date.now()
-    storage.upsertNode({ nodeType: "rule" as never, name: "Rule A", path: null, metadata: { content: "A" }, updatedAt: now, projectRoot: "C:/project-a" })
-    storage.upsertNode({ nodeType: "rule" as never, name: "Rule B", path: null, metadata: { content: "B" }, updatedAt: now, projectRoot: "C:/project-b" })
-    storage.upsertNode({ nodeType: "rule" as never, name: "Rule Global", path: null, metadata: { content: "G" }, updatedAt: now })
+    storage.upsertNode({ nodeType: NodeType.Rule, name: "Rule A", path: null, metadata: { content: "A" }, createdAt: now, updatedAt: now, projectRoot: "C:/project-a" })
+    storage.upsertNode({ nodeType: NodeType.Rule, name: "Rule B", path: null, metadata: { content: "B" }, createdAt: now, updatedAt: now, projectRoot: "C:/project-b" })
+    storage.upsertNode({ nodeType: NodeType.Rule, name: "Rule Global", path: null, metadata: { content: "G" }, createdAt: now, updatedAt: now })
 
     const projectA = storage.searchNodes("Rule", 10, "C:/project-a").map((node) => node.name).sort()
     const projectB = storage.searchNodes("Rule", 10, "C:/project-b").map((node) => node.name).sort()
@@ -623,11 +623,74 @@ describe("StorageEngine", () => {
     expect(row.cnt).toBe(0)
   })
 
+  test("insertSession is idempotent across plugin instances", () => {
+    const storage = createStorage()
+    const session = {
+      id: "ses_duplicate",
+      agentType: AgentType.Build,
+      status: SessionStatus.Created,
+      startedAt: Date.now(),
+      endedAt: null,
+      durationMs: null,
+      filesChangedCount: 0,
+      toolsUsedCount: 0,
+      errorsCount: 0,
+      projectRoot: "C:/project",
+      messageCount: 0,
+      totalTokensUsed: 0,
+      compactedFrom: null,
+    }
+
+    expect(storage.insertSession(session)).toBe(true)
+    expect(storage.insertSession(session)).toBe(false)
+    expect(storage.getSession("ses_duplicate")).toBeTruthy()
+  })
+
+  test("expires abandoned auto-tasks but keeps manual tasks", () => {
+    const storage = createStorage()
+    const auto = storage.createTask({
+      projectRoot: "C:/project", sessionId: "ses_auto", title: "Auto", goal: "Auto",
+      status: TaskStatus.Active, priority: 50, metadata: { auto_created: true },
+    })
+    const manual = storage.createTask({
+      projectRoot: "C:/project", sessionId: "ses_manual", title: "Manual", goal: "Manual",
+      status: TaskStatus.Active, priority: 50, metadata: { auto_created: false },
+    })
+    storage.getDb().prepare("UPDATE agent_tasks SET updated_at = ?1 WHERE id IN (?2, ?3)")
+      .run(Date.now() - 48 * 60 * 60 * 1000, auto.id, manual.id)
+
+    expect(storage.expireAutoTasks(24 * 60 * 60 * 1000)).toBe(1)
+    expect(storage.getTask(auto.id)?.status).toBe(TaskStatus.Cancelled)
+    expect(storage.getTask(manual.id)?.status).toBe(TaskStatus.Active)
+  })
+
+  test("accepts tool_warning and turn_completed event types", () => {
+    const storage = createStorage()
+    const now = Date.now()
+    storage.insertSession({
+      id: "ses_events", agentType: AgentType.Build, status: SessionStatus.Active,
+      startedAt: now, endedAt: null, durationMs: null, filesChangedCount: 0,
+      toolsUsedCount: 0, errorsCount: 0, projectRoot: "C:/project",
+      messageCount: 0, totalTokensUsed: 0, compactedFrom: null,
+    })
+    storage.enqueue("developer_events", {
+      event_type: "tool_warning", session_id: "ses_events", file_path: "src/a.ts",
+      metadata: JSON.stringify({ reason: "test", blocking: false }), timestamp: now,
+    })
+    storage.enqueue("developer_events", {
+      event_type: "turn_completed", session_id: "ses_events", file_path: null,
+      metadata: JSON.stringify({ kind: "turn", turn_index: 1 }), timestamp: now,
+    })
+    storage.flushBatch()
+    expect(storage.getDevEvents("tool_warning")).toHaveLength(1)
+    expect(storage.getDevEvents("turn_completed")).toHaveLength(1)
+  })
+
   test("enforces unique knowledge edges", () => {
     const storage = createStorage()
     const now = Date.now()
-    const source = storage.upsertNode({ nodeType: "file" as never, name: "a.ts", path: "a.ts", metadata: null, updatedAt: now })
-    const target = storage.upsertNode({ nodeType: "file" as never, name: "b.ts", path: "b.ts", metadata: null, updatedAt: now })
+    const source = storage.upsertNode({ nodeType: NodeType.File, name: "a.ts", path: "a.ts", metadata: null, createdAt: now, updatedAt: now })
+    const target = storage.upsertNode({ nodeType: NodeType.File, name: "b.ts", path: "b.ts", metadata: null, createdAt: now, updatedAt: now })
     storage.upsertEdge({ sourceId: source, targetId: target, edgeType: "imports" as never, weight: 1, evidenceCount: 1 })
 
     let duplicateRejected = false

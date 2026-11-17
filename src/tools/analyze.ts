@@ -602,24 +602,13 @@ async function handleMyStats(
   const daysTotal = daysFromTimeframe(timeframe)
   const sessionsPerDay = safeDiv(sessionCount, daysTotal)
 
-  // 2. Средняя длительность сессий (используем developer_events и sessions)
+  // 2. Средняя длительность сессий — из sessions.duration_ms.
+  // developer_events.session_completed больше не пишется на каждый idle
+  // (для ходов есть turn_completed), поэтому старый pairing давал ложные нули.
   const devEvents = storage.getDevEvents(undefined, timeframe, 5000, projectRoot)
-  const sessionStartEvents = devEvents.filter((e) => e.eventType === "session_start" || e.eventType === "session_started")
-  const sessionEndEvents = devEvents.filter((e) => e.eventType === "session_end" || e.eventType === "session_completed")
-
-  // Приблизительная оценка длительности по событиям
-  let totalDuration = 0
-  let sessionDurations = 0
-  for (let i = 0; i < Math.min(sessionStartEvents.length, sessionEndEvents.length); i++) {
-    const start = sessionStartEvents[i]
-    const end = sessionEndEvents.find((e) => e.sessionId === start.sessionId)
-    if (end && end.timestamp > start.timestamp) {
-      totalDuration += end.timestamp - start.timestamp
-      sessionDurations++
-    }
-  }
   const avgSessionDurationMs =
-    sessionDurations > 0 ? totalDuration / sessionDurations : sessionCount > 0 ? 15 * 60 * 1000 : 0
+    storage.getAverageSessionDurationMs(timeframe, projectRoot) ||
+    (sessionCount > 0 ? 15 * 60 * 1000 : 0)
 
   // 3. Топ файлов по количеству правок (полная выборка по БД)
   const topFiles = storage.getTopFilesByEdits(timeframe, 10, projectRoot)

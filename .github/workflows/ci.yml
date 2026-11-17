@@ -22,10 +22,13 @@ jobs:
           bun-version: '1.3.14'
 
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Typecheck tests
+        run: npm run typecheck:test
 
       - name: Typecheck TUI panel
         run: npm run typecheck:tui

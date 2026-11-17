@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { StorageEngine } from "../src/storage"
 import { createAgentTools } from "../src/tools/agent"
+import { AgentType, SessionStatus, TaskStatus } from "../src/types"
 
 const databases: Array<{ storage: StorageEngine; directory: string }> = []
 
@@ -58,7 +59,7 @@ describe("agent tools guardrails", () => {
 
     const blocked = await call(tools, "code_shadow_task", { action: "update", task_id: taskId, status: "completed" })
     expect(blocked.definition_of_done.ready).toBe(false)
-    expect(storage.getTask(taskId)?.status).toBe("active")
+    expect(storage.getTask(taskId)?.status).toBe(TaskStatus.Active)
   })
 
   test("cannot create a task directly in completed state", async () => {
@@ -112,5 +113,30 @@ describe("agent tools guardrails", () => {
     const close = await call(tools, "code_shadow_change_contract", { action: "close", contract_id: contractId })
     expect(close.error).toBeDefined()
     expect(storage.getChangeContract(contractId)?.status).toBe("violated")
+  })
+
+  test("agent insight separates guard warnings from blocking rejections", async () => {
+    const { storage, tools } = createFixture()
+    const now = Date.now()
+    storage.insertSession({
+      id: "ses_kpi", agentType: AgentType.Build, status: SessionStatus.Active,
+      startedAt: now, endedAt: null, durationMs: null, filesChangedCount: 0,
+      toolsUsedCount: 0, errorsCount: 0, projectRoot: "C:/project",
+      messageCount: 0, totalTokensUsed: 0, compactedFrom: null,
+    })
+    storage.enqueue("developer_events", {
+      event_type: "tool_warning", session_id: "ses_kpi", file_path: "src/a.ts",
+      metadata: JSON.stringify({ reason: "successful_edit_loop_warning", blocking: false }), timestamp: now,
+    })
+    storage.enqueue("developer_events", {
+      event_type: "tool_rejected", session_id: "ses_kpi", file_path: "src/b.ts",
+      metadata: JSON.stringify({ reason: "successful_edit_loop_blocked", blocking: true }), timestamp: now,
+    })
+    storage.flushBatch()
+
+    const quality = await call(tools, "code_shadow_agent_insight", { action: "quality" })
+    expect(quality.quality.guard_warnings).toBe(1)
+    expect(quality.quality.blocking_rejections).toBe(1)
+    expect(quality.warnings).toContain("есть non-blocking guard warnings (не считаются отказами)")
   })
 })

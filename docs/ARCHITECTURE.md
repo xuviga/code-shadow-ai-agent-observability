@@ -1,6 +1,6 @@
 # Архитектура Code Shadow
 
-> Актуально на v0.5.3 (12.11.2026). Источник правды — `src/`, миграции и тесты;
+> Актуально на 17.11.2026 (v0.5.3 + V2-совместимость). Источник правды — `src/`, миграции и тесты;
 > план исправлений и статус — [FIX_PLAN.md](FIX_PLAN.md).
 
 ## 1. Назначение
@@ -21,7 +21,7 @@ Code Shadow — локальный плагин OpenCode: постоянная �
 
 | Модуль | Ответственность |
 |---|---|
-| `src/index.ts` | точка входа: конфиг, StorageEngine, observer, TUI-хуки, 16 инструментов, интервалы, `dispose` |
+| `src/index.ts` | точка входа: конфиг, StorageEngine, observer, TUI-хуки, 16 инструментов, интервалы, `dispose`, CRUSH.md/AGENTS.md |
 | `src/storage.ts` | SQLite/WAL, миграции, CRUD, аналитические агрегаты, batch-очередь, retention |
 | `src/observer.ts` | приём событий/хуков, телеметрия, auto-memory, auto-task, auto-evidence, guardrails |
 | `src/tools/agent.ts` | Task Graph, Evidence, Failure Memory, Change Contract, Context Router, Counterfactual, Handoff, Insight, Contradiction, Provenance |
@@ -30,6 +30,8 @@ Code Shadow — локальный плагин OpenCode: постоянная �
 | `src/tools/context.ts` | `code_shadow_context_inject` |
 | `src/tools/decide.ts` | ADR + узлы/рёбра графа знаний |
 | `src/tui.ts` | серверные TUI-хуки: риск-тосты, `/shadow`, briefing при compaction |
+| `src/v2.ts` | адаптер OpenCode 2: V2 hooks/events → V1-ядро, 14 подписок, буфер шагов |
+| `src/tui-v2.ts` | адаптер V2 TUI: `ui.slot`/`data.on` → V1 `slots.register`/`event.on` |
 | `tui-plugin.tsx` | SolidJS-панель сайдбара (read-only SQLite) |
 | `src/path-match.ts` | glob-матчер контрактов (`*`, `**`, `?`, Windows-пути) |
 | `src/import-graph.ts` | индексатор импортов для `dependency_graph` |
@@ -50,7 +52,7 @@ OpenCode event/hook
              tools/analyze.ts          tools/memory/context       tui-plugin.tsx
              (агрегаты, 9 режимов)     (память, ADR, scope)       (сайдбар, read-only)
                     │
-                    └──► CRUSH.md (инструкции для агента, refresh 3 мин)
+                    └──► CRUSH.md + AGENTS.md (инструкции для агента, refresh 3 мин)
 ```
 
 ## 4. Жизненный цикл
@@ -59,11 +61,14 @@ OpenCode event/hook
    умолчанию — в `src/config.ts`. `~` разворачивается через env (`USERPROFILE`/
    `HOME`) с fallback на `os.homedir()`.
 2. `new StorageEngine(config)`: mkdir, `bun:sqlite`, `journal_mode=WAL`,
-   `busy_timeout=5000`, `foreign_keys=ON`, миграции 001–011.
+   `busy_timeout=5000`, `foreign_keys=ON`, миграции 001–012.
 3. `runCleanup()` на старте и далее каждые 6 часов.
-4. Интервалы: `flushBatch` каждые 5 с, CRUSH refresh каждые 10 с (по dirty-флагу
-   или раз в 3 минуты).
-5. `ensureCrushMd` и `ensureTuiPlugin`: CRUSH.md и установка/мерж `tui.json`.
+4. Интервалы: `flushBatch` каждые 5 с, CRUSH/AGENTS refresh проверяется каждые
+   10 с, но запись выполняется не чаще одного раза в 3 минуты (иначе OpenCode 2
+   получал бы новую instruction-инъекцию на каждый observer-event).
+5. `ensureCrushMd` и `ensureTuiPlugin`: один блок инструкций пишется в
+   `CRUSH.md` (OpenCode 1) и `AGENTS.md` (OpenCode 2) с сохранением
+   пользовательского текста вне маркеров; установка/мерж `tui.json`.
 6. Регистрация 16 инструментов и observer/TUI-хуков.
 7. `dispose` (или exit/SIGINT/SIGTERM): снять интервалы и process-listeners,
    flush, закрыть БД.
@@ -99,8 +104,13 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
   Warning на 3-й успешной мутации; блокировка при повторе контента (≥2) или
   5 подряд полных `write`. Targeted `edit` сбрасывает `writeStreak`. Сброс:
   `chat.message`, успешная verification-команда, истечение окна.
-- **Failure-loop**: одинаковый tool+args с ошибкой 3 раза → `tool_rejected`
-  (`agent_loop_detected`); TTL 10 минут, cap 5000 ключей.
+- **Failure-loop**: одинаковый tool+args с ошибкой 3 раза → `tool_warning`
+  (`agent_loop_detected`, `blocking=false`); TTL 10 минут, cap 5000 ключей.
+- **Event taxonomy**: `tool_rejected` — только блокирующие события
+  (`blocking=true`, `severity=error|critical`); `tool_warning` — advisory
+  (`successful_edit_loop_warning`, `change_contract_preflight`,
+  `agent_loop_detected`). `turn_completed` пишется на каждый idle, а
+  `session_completed` больше не используется как per-turn метрика.
 - **Change Contract**: пути проверяются `pathMatches` (glob, Windows, project
   root, `./`/`..` нормализуются). Preflight warning, hard deny в
   `permission.ask`, post-edit фиксация violations. Пустой `check` не считается
@@ -115,7 +125,7 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
 
 ## 7. Хранение
 
-- 19 таблиц + FTS5-таблица `knowledge_nodes_fts`; миграции 001–011, версия в
+- 19 таблиц + FTS5-таблица `knowledge_nodes_fts`; миграции 001–012, версия в
   `schema_version`.
 - Batch-очередь: `batchSize` (default 10), flush каждые 5 с; при ошибке batch
   выполняется построчная запись, «отравленные» строки логируются, очередь не
@@ -155,6 +165,10 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
 - Сайдбар (`tui-plugin.tsx`): read-only БД, слот `sidebar_content`, обновление
   по событиям с debounce и polling 5 с. Устанавливается postinstall/рантаймом
   в `~/.config/opencode/plugins/code-shadow/` и мержится в `tui.json`.
+- OpenCode 2 подключает панель через `src/tui-v2.ts`: адаптер мостит
+  `ui.slot("sidebar.content")` и `data.on` на V1 API `slots.register` /
+  `event.on`. `tui.json` содержит одну запись
+  `./plugins/code-shadow/tui-v2.ts`; legacy-запись V1 удаляется при мерже.
 
 ## 10. Безопасность и ограничения
 
@@ -165,3 +179,33 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
   payload хоста, FTS — токены/префиксы (не семантический поиск), host harness
   в CI ограничен smoke-тестом `tests/plugin-smoke.test.ts`; отдельный ручной
   прогон на OpenCode 1.18.30 выполнен (serve + session lifecycle).
+
+## 11. Адаптер OpenCode 2
+
+`src/v2.ts` — единственная точка входа V2 (`exports["."]`). Он поднимает то же
+ядро, что и `src/index.ts`, и переводит V2 API в V1-контракты.
+
+- **Tools**: `ctx.tool.transform` регистрирует 16 инструментов с
+  `codemode: false`; `ctx.tool.hook("execute.before"/"execute.after")` вызывает
+  V1-guardrails, `ctx.session.hook("prompt")` — auto-task, `ctx.session.hook("compaction")`
+  — briefing, `ctx.permission.hook("evaluate")` — hard deny Change Contract.
+- **Events**: 14 подписок (`V2_EVENT_TYPES`), проверяемых компилятором по union'у
+  хоста. `session.created/deleted/renamed/moved/status`, `session.idle`,
+  `session.execution.failed/succeeded/interrupted`, `session.compaction.ended`,
+  `session.step.ended`, `filesystem.changed`, `tui.prompt.append`.
+- **Правки**: `session.step.ended.files` → `file.edited` с атрибуцией сессии;
+  `filesystem.changed` даёт внешние правки и `human_fix`, `unlink` — no-op.
+  `V2StepUsageBuffer` суммирует токены/cost и отправляет один `message.updated`
+  перед idle.
+- **Завершение хода**: `execution.succeeded/interrupted` (как и `session.idle`)
+  сбрасывают буфер и эмитят V1 `session.idle`; `execution.failed` сначала
+  сохраняет токены, затем даёт `session.error`.
+- **Location**: приоритет `data.location.directory` → `location.directory` →
+  `ctx.location.directory`; этот путь становится `project_root`.
+- **Ограничения**: в V2 нет `todo.updated`, LSP-событий и
+  `message.updated/part.updated`; todo-синхронизация и LSP-захват отключены,
+  message-метрики аппроксимируются буфером шагов. `tui.command.execute` даёт
+  частичную замену `command.executed` только для TUI-команд.
+
+Подробная таблица соответствий, упаковка и установка TUI — в
+[V2_COMPATIBILITY.md](V2_COMPATIBILITY.md).

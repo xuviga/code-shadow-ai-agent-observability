@@ -52,6 +52,7 @@ import { migrateV008ProjectScope } from "./migrations/008_project_scope";
 import { migrateV009AnalyticsIndexes } from "./migrations/009_analytics_indexes";
 import { migrateV010KnowledgeNodeNaturalKey } from "./migrations/010_knowledge_node_natural_key";
 import { migrateV011KnowledgeFts } from "./migrations/011_knowledge_fts";
+import { migrateV012EventTaxonomy } from "./migrations/012_event_taxonomy";
 import { pathMatches } from "./path-match";
 
 // ---------------------------------------------------------------------------
@@ -459,6 +460,7 @@ export class StorageEngine {
       { version: 9, description: "009 (аналитические индексы и unique edges)", run: migrateV009AnalyticsIndexes },
       { version: 10, description: "010 (natural-key уникальность knowledge_nodes)", run: migrateV010KnowledgeNodeNaturalKey },
       { version: 11, description: "011 (FTS5-индекс памяти)", run: migrateV011KnowledgeFts },
+      { version: 12, description: "012 (tool_warning/turn_completed)", run: migrateV012EventTaxonomy },
     ];
 
     log.debug(`Текущая версия схемы: ${this.readSchemaVersion()}`);
@@ -623,20 +625,27 @@ export class StorageEngine {
   // CRUD: sessions
   // =========================================================================
 
-  /** Вставляет новую сессию. */
-  insertSession(session: Omit<Session, "id">): void {
+  /**
+   * Вставляет новую сессию. Returns true when this call created the row.
+   *
+   * Multiple OpenCode workspaces can load the plugin in the same process and
+   * all receive global session events. A duplicate session.created must not
+   * be treated as an error and must not emit a second session_started event.
+   */
+  insertSession(session: Omit<Session, "id"> & { id?: string }): boolean {
     try {
       const db = this.getDb();
       const fullSession = session as Record<string, unknown>;
       const id =
         (fullSession.id as string) || generateSessionId();
 
-      db.prepare(
+      const result = db.prepare(
         `INSERT INTO sessions
           (id, agent_type, status, started_at, ended_at, duration_ms,
            files_changed_count, tools_used_count, errors_count,
            project_root, message_count, total_tokens_used, compacted_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO NOTHING`,
       ).run(
         id,
         session.agentType,
@@ -653,9 +662,12 @@ export class StorageEngine {
         session.compactedFrom ?? null,
       );
 
-      log.debug(`Сессия вставлена: id=${id}`);
+      const created = Number(result.changes) > 0;
+      log.debug(`Сессия ${created ? "вставлена" : "уже существует"}: id=${id}`);
+      return created;
     } catch (err) {
       log.error(`Ошибка insertSession: ${String(err)}`);
+      return false;
     }
   }
 
@@ -978,6 +990,60 @@ export class StorageEngine {
     return rows.map((row) => this.taskRow(row))
   }
 
+  /**
+   * Task lookup scoped to one session. Auto-evidence runs inside a concrete
+   * session, so it must never borrow another session's task just because both
+   * sessions share a project root (concurrent reviews hit exactly this).
+   */
+  getActiveTaskForSession(sessionId: string): AgentTask | undefined {
+    const row = this.getDb().prepare(
+      `SELECT * FROM agent_tasks WHERE session_id = ?1 AND status = 'active' ORDER BY updated_at DESC LIMIT 1`,
+    ).get(sessionId) as Record<string, any> | undefined
+    return row ? this.taskRow(row) : undefined
+  }
+
+  /** Any non-terminal task for a session (used to avoid auto-task duplicates). */
+  getOpenTaskForSession(sessionId: string): AgentTask | undefined {
+    const row = this.getDb().prepare(
+      `SELECT * FROM agent_tasks
+       WHERE session_id = ?1 AND status IN ('planned','active','blocked')
+       ORDER BY updated_at DESC LIMIT 1`,
+    ).get(sessionId) as Record<string, any> | undefined
+    return row ? this.taskRow(row) : undefined
+  }
+
+  /**
+   * Cancels auto-created tasks that stopped making progress. Called by the
+   * cleanup interval; manual tasks are never touched.
+   */
+  expireAutoTasks(maxAgeMs = 24 * 60 * 60 * 1000): number {
+    try {
+      const now = Date.now()
+      const result = this.getDb().prepare(
+        `UPDATE agent_tasks
+         SET status = 'cancelled', updated_at = ?1
+         WHERE status IN ('planned','active','blocked')
+           AND json_extract(metadata, '$.auto_created') = 1
+           AND updated_at < ?2`,
+      ).run(now, now - Math.max(1, maxAgeMs))
+      const changes = Number(result.changes)
+      if (changes > 0) log.info(`Авто-задачи отменены по TTL: ${changes}`)
+      return changes
+    } catch (err) {
+      log.error(`Ошибка expireAutoTasks: ${String(err)}`)
+      return 0
+    }
+  }
+
+  /** Keeps parent task freshness aligned with its steps for auto-task TTL. */
+  private touchTask(taskId: string, at = Date.now()): void {
+    try {
+      this.getDb().prepare(`UPDATE agent_tasks SET updated_at = ?1 WHERE id = ?2`).run(at, taskId)
+    } catch {
+      // Task freshness is best effort; the step write already succeeded.
+    }
+  }
+
   updateTask(id: string, patch: Partial<Pick<AgentTask, "title" | "goal" | "status" | "priority" | "metadata">>): AgentTask | undefined {
     const fields: string[] = [], values: unknown[] = []
     for (const [key, value] of Object.entries(patch)) {
@@ -1048,6 +1114,7 @@ export class StorageEngine {
       input.status === "completed" || input.status === "skipped" ? now : null,
       this.json(input.metadata),
     )
+    this.touchTask(input.taskId, now)
     return this.getTaskStep(id)!
   }
 
@@ -1063,8 +1130,11 @@ export class StorageEngine {
   updateTaskStep(id: string, status: string, blockedBy?: string | null): TaskStep | undefined {
     const completed = status === "completed" ? Date.now() : null
     // Omitted blockedBy keeps the current value; an explicit value replaces it.
-    this.getDb().prepare(`UPDATE task_steps SET status = ?1, blocked_by = COALESCE(?2, blocked_by), completed_at = ?3, updated_at = ?4 WHERE id = ?5`).run(status, blockedBy ?? null, completed, Date.now(), id)
-    return this.getTaskStep(id)
+    const now = Date.now()
+    this.getDb().prepare(`UPDATE task_steps SET status = ?1, blocked_by = COALESCE(?2, blocked_by), completed_at = ?3, updated_at = ?4 WHERE id = ?5`).run(status, blockedBy ?? null, completed, now, id)
+    const step = this.getTaskStep(id)
+    if (step) this.touchTask(step.taskId, now)
+    return step
   }
 
   recordEvidence(input: Omit<EvidenceRecord, "id" | "createdAt" | "verifiedAt"> & { id?: string }): EvidenceRecord {
@@ -1969,6 +2039,24 @@ export class StorageEngine {
     }
   }
 
+  /** Средняя длительность завершённых сессий за период (0, если данных нет). */
+  getAverageSessionDurationMs(timeframe?: string, projectRoot?: string): number {
+    try {
+      const db = this.getDb();
+      const cutoff = timeframeToCutoff(timeframe);
+      const row = db.prepare(
+        `SELECT AVG(duration_ms) AS avg_ms FROM sessions
+         WHERE duration_ms IS NOT NULL AND duration_ms > 0
+           AND (?1 IS NULL OR started_at >= ?1)
+           AND (?2 IS NULL OR project_root = ?2)`,
+      ).get(cutoff, projectRoot ?? null) as { avg_ms: number | null };
+      return row.avg_ms ?? 0;
+    } catch (err) {
+      log.error(`Ошибка getAverageSessionDurationMs: ${String(err)}`);
+      return 0;
+    }
+  }
+
   // =========================================================================
   // CRUD: analytics_cache
   // =========================================================================
@@ -2352,6 +2440,16 @@ export class StorageEngine {
           `DELETE FROM analytics_cache WHERE (valid_until IS NOT NULL AND valid_until < ?1) OR computed_at < ?2`,
         ).run(Date.now(), cacheCutoff);
         db.prepare(`DELETE FROM provenance_events WHERE created_at < ?1`).run(rawCutoff);
+
+        // Abandoned auto-tasks otherwise accumulate forever (429 active on the
+        // live database) and pollute context_router/task lists.
+        db.prepare(
+          `UPDATE agent_tasks
+           SET status = 'cancelled', updated_at = ?1
+           WHERE status IN ('planned','active','blocked')
+             AND json_extract(metadata, '$.auto_created') = 1
+             AND updated_at < ?2`,
+        ).run(Date.now(), Date.now() - 24 * 60 * 60 * 1000);
 
         log.info(
           `Очистка выполнена: события старше ${safeRetention}д, сессии старше ${safeSessionRetention}д.`,

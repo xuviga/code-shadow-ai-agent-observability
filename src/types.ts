@@ -90,11 +90,13 @@ export enum DevEventType {
   SessionStart = "session_start",
   SessionEnd = "session_end",
   SessionCompleted = "session_completed",
+  TurnCompleted = "turn_completed",
   TodoCompleted = "todo_completed",
   LspDiagnostic = "lsp_diagnostic",
   LspDiagnosticSummary = "lsp_diagnostic_summary",
   FileFocus = "file_focus",
   ToolRejected = "tool_rejected",
+  ToolWarning = "tool_warning",
 }
 
 /** Уровень риска */

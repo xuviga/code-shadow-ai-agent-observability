@@ -9,6 +9,6 @@
     "jsx": "preserve",
     "types": ["bun-types"]
   },
-  "include": ["tui-plugin.tsx", "types/**/*.d.ts"],
+  "include": ["tui-plugin.tsx", "src/tui-v2.ts", "types/**/*.d.ts"],
   "exclude": ["node_modules", "dist", ".tui-dist"]
 }

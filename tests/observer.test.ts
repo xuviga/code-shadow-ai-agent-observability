@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { StorageEngine } from "../src/storage"
 import { createObserver } from "../src/observer"
+import { AgentType, EvidenceStatus, SessionStatus, TaskStepStatus } from "../src/types"
 
 const databases: Array<{ storage: StorageEngine; directory: string }> = []
 
@@ -94,7 +95,7 @@ describe("Observer", () => {
     const edit = storage.getFileEdits("src/index.ts")[0]
     expect(edit.projectRoot).toBe("C:/project")
     // The session agent is inherited when the edit payload has no agent field.
-    expect(edit.agentType).toBe("explore")
+    expect(edit.agentType).toBe(AgentType.Explore)
   })
 
   test("stores LSP errors and todos for the active session", async () => {
@@ -235,8 +236,70 @@ describe("Observer", () => {
 
     const evidence = storage.listEvidence("C:/project", task.id)
     expect(evidence).toHaveLength(1)
-    expect(evidence[0].status).toBe("verified")
+    expect(evidence[0].status).toBe(EvidenceStatus.Verified)
     expect(evidence[0].evidenceType).toBe("command")
+  })
+
+  test("auto-evidence is attributed to the task of its own session", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionA = "observer-session-evidence-a"
+    const sessionB = "observer-session-evidence-b"
+    for (const id of [sessionA, sessionB]) {
+      await observer.event({
+        event: {
+          type: "session.created",
+          properties: { info: { id, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+        },
+      })
+    }
+    const taskB = storage.createTask({
+      projectRoot: "C:/project", sessionId: sessionB, title: "Task B", goal: "B",
+      status: "active" as never, priority: 50, metadata: null,
+    })
+    const taskA = storage.createTask({
+      projectRoot: "C:/project", sessionId: sessionA, title: "Task A", goal: "A",
+      status: "active" as never, priority: 50, metadata: null,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    // Session A's task is the newest active task in the project. The old
+    // project-wide lookup would attribute session B's command to it.
+    storage.updateTask(taskA.id, { priority: 60 })
+    // Guard the fixture itself: the legacy project-wide lookup returns task A.
+    expect(storage.listTasks("C:/project", "active", 1)[0].id).toBe(taskA.id)
+
+    await observer["tool.execute.after"]({
+      tool: "bash", sessionID: sessionB, callID: "verify-b", args: { command: "bun test" },
+    }, { title: "bun test", output: "ok", metadata: {} })
+
+    expect(storage.listEvidence("C:/project", taskB.id)).toHaveLength(1)
+    expect(storage.listEvidence("C:/project", taskA.id)).toHaveLength(0)
+  })
+
+  test("auto-evidence stays unattributed when the session has no task", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionA = "observer-session-evidence-owner"
+    const sessionB = "observer-session-evidence-untasked"
+    for (const id of [sessionA, sessionB]) {
+      await observer.event({
+        event: {
+          type: "session.created",
+          properties: { info: { id, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+        },
+      })
+    }
+    const taskA = storage.createTask({
+      projectRoot: "C:/project", sessionId: sessionA, title: "Task A", goal: "A",
+      status: "active" as never, priority: 50, metadata: null,
+    })
+
+    await observer["tool.execute.after"]({
+      tool: "bash", sessionID: sessionB, callID: "verify-untasked", args: { command: "bun test" },
+    }, { title: "bun test", output: "ok", metadata: {} })
+
+    const evidence = storage.listEvidence("C:/project")
+    expect(evidence).toHaveLength(1)
+    expect(evidence[0].taskId).toBeNull()
+    expect(storage.listEvidence("C:/project", taskA.id)).toHaveLength(0)
   })
 
   test("rejects noisy commands and success outputs that contain failures", async () => {
@@ -267,7 +330,7 @@ describe("Observer", () => {
 
     const evidence = storage.listEvidence("C:/project")
     expect(evidence).toHaveLength(1)
-    expect(evidence[0].status).toBe("failed")
+    expect(evidence[0].status).toBe(EvidenceStatus.Failed)
   })
 
   test("guards patch tools and parses patched file names for contracts", async () => {
@@ -290,7 +353,7 @@ describe("Observer", () => {
       { args: { patchText: "*** Update File: README.md\n@@\n-old\n+new" } },
     )
     storage.flushBatch()
-    const warning = storage.getDevEvents("tool_rejected").find((event) => String(event.metadata?.reason) === "change_contract_preflight")
+    const warning = storage.getDevEvents("tool_warning").find((event) => String(event.metadata?.reason) === "change_contract_preflight")
     expect(warning?.filePath).toBe("README.md")
 
     for (let index = 0; index < 3; index += 1) {
@@ -330,11 +393,11 @@ describe("Observer", () => {
     }
     storage.flushBatch()
 
-    const warning = storage.getDevEvents("tool_rejected").find((event) => String(event.metadata?.reason) === "successful_edit_loop_warning")
+    const warning = storage.getDevEvents("tool_warning").find((event) => String(event.metadata?.reason) === "successful_edit_loop_warning")
     expect(warning?.filePath).toBe("C:/test/collector_async.py")
     expect(warning?.metadata?.repeats).toBe(3)
 
-    const permission = { status: "ask" as const }
+    const permission: { status: "ask" | "deny" | "allow" } = { status: "ask" }
     await observer["permission.ask"]({
       id: "permission-write-loop", type: "write", pattern: "C:/test/collector_async.py",
       sessionID: sessionId, messageID: "message-loop", title: "Rewrite file", metadata: {},
@@ -482,7 +545,7 @@ describe("Observer", () => {
     })
     await observer["tool.execute.before"]({ tool: "edit", sessionID: sessionId, callID: "preflight-1" }, { args: { filePath: "README.md" } })
     storage.flushBatch()
-    const warning = storage.getDevEvents("tool_rejected").find((event) => String(event.metadata?.reason) === "change_contract_preflight")
+    const warning = storage.getDevEvents("tool_warning").find((event) => String(event.metadata?.reason) === "change_contract_preflight")
     expect(warning).toBeTruthy()
   })
 
@@ -501,16 +564,11 @@ describe("Observer", () => {
     const task = storage.listTasks("C:/project", "active", 10)[0]
     expect(task?.metadata).toEqual({ source: "chat.message", message_id: "message-1", auto_created: true })
     const steps = storage.listTaskSteps(task!.id)
-    expect(steps[0].status).toBe("in_progress")
+    expect(steps[0].status).toBe(TaskStepStatus.InProgress)
     expect(steps.map((step) => step.title)).toEqual([
-      "Изучить релевантный код и контекст проекта",
-      "Воспроизвести проблему и найти root cause",
-      "Проверить затронутые границы, зависимости и исторический риск",
-      "Реализовать изменение в пределах Change Contract",
-      "Добавить или обновить regression tests",
-      "Запустить verification-команды и записать verified evidence",
+      "Выполнить запрос пользователя",
     ])
-    expect(steps.slice(1).every((step) => step.status === "pending")).toBe(true)
+    expect(steps.every((step) => step.status === TaskStepStatus.InProgress)).toBe(true)
   })
 
   test("denies permission when an edit violates an active contract", async () => {
@@ -527,7 +585,7 @@ describe("Observer", () => {
       goal: "Keep edits under src", allowedPaths: ["src/"], forbiddenPaths: [".env"],
       plannedPaths: ["src/index.ts"], verificationPlan: ["bun test"],
     })
-    const denied = { status: "ask" as const }
+    const denied: { status: "ask" | "deny" | "allow" } = { status: "ask" }
     await observer["permission.ask"]({ id: "permission-1", type: "edit", pattern: "README.md", sessionID: sessionId, messageID: "message-2", title: "Edit README", metadata: {} }, denied)
     expect(denied.status).toBe("deny")
     const allowed = { status: "ask" as const }
@@ -547,8 +605,8 @@ describe("Observer", () => {
     })
     await observer["chat.message"]({ sessionID: sessionId, agent: "plan" }, { parts: [{ type: "text", text: "hi" }] })
     const session = storage.getSession(sessionId)!
-    expect(session.agentType).toBe("plan")
-    expect(session.status).toBe("active")
+    expect(session.agentType).toBe(AgentType.Plan)
+    expect(session.status).toBe(SessionStatus.Active)
   })
 
   test("compaction keeps the session id because the event only has sessionID", async () => {
@@ -559,7 +617,7 @@ describe("Observer", () => {
     })
     await observer.event({ event: { type: "session.compacted", properties: { sessionID: sessionId } } })
     const session = storage.getSession(sessionId)!
-    expect(session.status).toBe("compacted")
+    expect(session.status).toBe(SessionStatus.Compacted)
     const count = storage.getDb().prepare("SELECT COUNT(*) as cnt FROM sessions").get() as { cnt: number }
     expect(count.cnt).toBe(1)
   })
@@ -576,7 +634,7 @@ describe("Observer", () => {
         properties: { sessionID: sessionId, error: { name: "APIError", data: { message: "provider exploded", statusCode: 500, isRetryable: true } } },
       },
     })
-    expect(storage.getSession(sessionId)!.status).toBe("error")
+    expect(storage.getSession(sessionId)!.status).toBe(SessionStatus.Error)
     const errors = storage.getDb().prepare("SELECT error_type, error_message FROM session_errors WHERE session_id = ?").all(sessionId) as Array<{ error_type: string; error_message: string }>
     expect(errors).toHaveLength(1)
     expect(errors[0].error_type).toBe("model_error")
@@ -622,7 +680,7 @@ describe("Observer", () => {
     const edits = storage.getFileEdits("src/sdk-file.ts")
     expect(edits).toHaveLength(1)
     expect(edits[0].sessionId).toBe(sessionId)
-    expect(edits[0].agentType).toBe("build")
+    expect(edits[0].agentType).toBe(AgentType.Build)
     expect(edits[0].diffPreview).toBeNull()
   })
 
@@ -651,7 +709,8 @@ describe("Observer", () => {
     storage.flushBatch()
     const rows = storage.getDb().prepare("SELECT tool_name, target_file, status FROM tool_executions WHERE session_id = ? ORDER BY id").all(sessionId) as Array<{ tool_name: string; target_file: string | null; status: string }>
     expect(rows.map((row) => row.status)).toEqual(["success", "denied", "error", "success"])
-    expect(rows[3].target_file).toBe("src/status.ts")
+    // Tool args are relative; the row stores the absolute project path.
+    expect(rows[3].target_file).toBe("C:/project/src/status.ts")
   })
 
   test("flushes pending batch before session.idle counts", async () => {
@@ -670,13 +729,13 @@ describe("Observer", () => {
     )
     await observer.event({ event: { type: "session.idle", properties: { sessionID: sessionId } } })
     const session = storage.getSession(sessionId)!
-    expect(session.status).toBe("idle")
+    expect(session.status).toBe(SessionStatus.Idle)
     expect(session.toolsUsedCount).toBe(2)
 
     // A duplicate idle event must not overwrite the completed session.
     await observer.event({ event: { type: "session.idle", properties: { sessionID: sessionId } } })
     storage.flushBatch()
-    const completed = storage.getDb().prepare("SELECT COUNT(*) as cnt FROM developer_events WHERE session_id = ? AND event_type = 'session_completed'").get(sessionId) as { cnt: number }
+    const completed = storage.getDb().prepare("SELECT COUNT(*) as cnt FROM developer_events WHERE session_id = ? AND event_type = 'turn_completed'").get(sessionId) as { cnt: number }
     expect(completed.cnt).toBe(1)
   })
 
@@ -694,6 +753,81 @@ describe("Observer", () => {
     expect(summary).toBeTruthy()
 
     await observer.event({ event: { type: "session.deleted", properties: { info: { id: sessionId } } } })
-    expect(storage.getSession(sessionId)!.status).toBe("deleted")
+    expect(storage.getSession(sessionId)!.status).toBe(SessionStatus.Deleted)
+  })
+
+  test("a duplicate session.created does not emit a second session_started", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-duplicate"
+    const event = {
+      event: {
+        type: "session.created",
+        properties: { info: { id: sessionId, directory: "C:/project", time: { created: Date.now() } } },
+      },
+    }
+    await observer.event(event)
+    await observer.event(event)
+    storage.flushBatch()
+
+    const started = storage.getDb().prepare(
+      "SELECT COUNT(*) AS cnt FROM developer_events WHERE session_id = ?1 AND event_type = 'session_started'",
+    ).get(sessionId) as { cnt: number }
+    expect(started.cnt).toBe(1)
+  })
+
+  test("auto-task keeps one open task and one step per session", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-single-task"
+    await observer.event({
+      event: {
+        type: "session.created",
+        properties: { info: { id: sessionId, agent: "build", directory: "C:/project", time: { created: Date.now() } } },
+      },
+    })
+    await observer["chat.message"]({ sessionID: sessionId, messageID: "m1" }, {
+      parts: [{ type: "text", text: "Implement authentication and add regression tests" }],
+    })
+    await observer["chat.message"]({ sessionID: sessionId, messageID: "m2" }, {
+      parts: [{ type: "text", text: "Also refactor the login flow" }],
+    })
+
+    const tasks = storage.listTasks("C:/project", "active", 10)
+      .filter((task) => task.sessionId === sessionId)
+    expect(tasks).toHaveLength(1)
+    expect(storage.listTaskSteps(tasks[0].id)).toHaveLength(1)
+  })
+
+  test("idle writes turn_completed, not a legacy session_completed", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-turn"
+    await observer.event({
+      event: { type: "session.created", properties: { info: { id: sessionId, directory: "C:/project", time: { created: Date.now() } } } },
+    })
+    await observer.event({ event: { type: "session.idle", properties: { sessionID: sessionId } } })
+    storage.flushBatch()
+
+    const counts = storage.queryRows<{ event_type: string; cnt: number }>(
+      `SELECT event_type, COUNT(*) AS cnt FROM developer_events
+       WHERE session_id = ?1 AND event_type IN ('turn_completed','session_completed')
+       GROUP BY event_type`,
+      sessionId,
+    )
+    expect(counts.find((row) => row.event_type === "turn_completed")?.cnt).toBe(1)
+    expect(counts.find((row) => row.event_type === "session_completed")).toBeUndefined()
+
+    // If a normal idle arrives before execution.interrupted, the marker must
+    // still be attached to the already-written turn.
+    await observer.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: sessionId, interrupted: true, reason: "user" },
+      },
+    })
+    storage.flushBatch()
+    const turn = storage.getDb().prepare(
+      "SELECT metadata FROM developer_events WHERE session_id = ?1 AND event_type = 'turn_completed' ORDER BY timestamp DESC LIMIT 1",
+    ).get(sessionId) as { metadata: string }
+    expect(turn.metadata).toContain("\"interrupted\":true")
+    expect(turn.metadata).toContain("\"interrupt_reason\":\"user\"")
   })
 })

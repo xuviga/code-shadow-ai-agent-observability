@@ -46,6 +46,8 @@ npm run typecheck
 npm test
 ```
 
+After upgrading, run `opencode reload` (or restart OpenCode) so the new entry point and `AGENTS.md` rules are loaded, then verify the installation with `npm run doctor`. The doctor prints PASS/WARN/FAIL lines for exports, instruction markers, TUI config, the installed adapter, and the shadow DB schema. See [Upgrading Code Shadow](docs/UPGRADE.md) for the full checklist, log checks, and the `./v1` entry for OpenCode 1 users.
+
 ### Agent workflow
 
 ```text
@@ -80,6 +82,8 @@ preventing normal iterative bug fixing.
 | [AI Tools API](docs/TOOLS_API.md) | Tool contracts available to OpenCode agents |
 | [Data Model](docs/DATA_MODEL.md) | SQLite entities and relationships |
 | [Implementation status](docs/IMPLEMENTATION_STATUS.md) | What is implemented and how it is verified |
+| [V2 compatibility](docs/V2_COMPATIBILITY.md) | OpenCode 2 events, packaging, TUI and AGENTS.md |
+| [Upgrading](docs/UPGRADE.md) | Reload, doctor, lockfile and V1 package-root migration |
 | [Roadmap](docs/ROADMAP.md) | Planned product direction |
 | [Contributing](CONTRIBUTING.md) | Development workflow and pull-request standards |
 | [Security](SECURITY.md) | Local-data model and responsible disclosure |
@@ -595,7 +599,7 @@ opencode plugin https://github.com/xuviga/code-shadow-ai-agent-observability --g
 
 Всё! Плагин автоматически:
 - Добавится в `opencode.jsonc`
-- Создаст `CRUSH.md` с автономными правилами
+- Создаст `AGENTS.md` с автономными правилами (OpenCode 2) и `CRUSH.md` для обратной совместимости
 - Начнёт собирать статистику при следующем запуске
 
 После установки плагин работает АВТОНОМНО:
@@ -634,13 +638,15 @@ git clone https://github.com/xuviga/code-shadow-ai-agent-observability.git ~/.co
 |-------------|---------------|
 | `bun:sqlite` | Встроен в Bun |
 | `@opencode-ai/plugin` | Peer-зависимость, разрешается OpenCode |
+| `@opencode/plugin` | Peer-зависимость OpenCode 2, разрешается хостом |
 | `@opentui/solid` | Peer-зависимость, разрешается OpenCode |
 
 ### Где хранятся данные
 
 ```
 ~/.config/opencode/
-├── CRUSH.md                 # Авто-системный промпт (создаётся плагином)
+├── AGENTS.md                # Авто-инструкции для OpenCode 2
+├── CRUSH.md                 # То же для OpenCode 1 (legacy)
 ├── shadow/
 │   ├── data.db              # SQLite база со всеми событиями
 │   └── shadow.log           # Лог плагина
@@ -758,15 +764,21 @@ Code Shadow — первый плагин OpenCode, который застав�
 Вместо того чтобы ждать команды пользователя, AI сам вызывает инструменты аналитики
 благодаря трём механизмам автономности.
 
-### Механизм 1: CRUSH.md
+### Механизм 1: CRUSH.md / AGENTS.md
 
 **CRUSH.md** — это системный файл, который плагин автоматически создаёт и
 поддерживает в `~/.config/opencode/CRUSH.md`. OpenCode читает его перед каждой
 сессией и передаёт AI-агенту как часть системного промпта.
 
+OpenCode 2 читает только `AGENTS.md`, поэтому плагин пишет один и тот же
+marker-блок в оба файла: `~/.config/opencode/AGENTS.md` (OpenCode 2) и
+`~/.config/opencode/CRUSH.md` (OpenCode 1, обратная совместимость).
+Пользовательский текст вне маркеров сохраняется.
+
 ```
 ~/.config/opencode/
-├── CRUSH.md    ← Создаётся и обновляется Code Shadow при каждом старте
+├── AGENTS.md   ← Создаётся и обновляется Code Shadow (OpenCode 2)
+├── CRUSH.md    ← Тот же блок для OpenCode 1
 ├── shadow/
 │   └── data.db
 └── ...
@@ -812,8 +824,9 @@ Code Shadow — первый плагин OpenCode, который застав�
 4. AI видит правила как **жёсткие инструкции** (mandatory rules)
 5. AI проактивно вызывает `code_shadow_*` тулзы без запроса пользователя
 
-**CRUSH.md пересоздаётся при каждом старте плагина** — это гарантирует, что AI
-всегда видит актуальную статистику, а не устаревшие данные.
+**Блок Code Shadow в CRUSH.md и AGENTS.md пересоздаётся при каждом обновлении** —
+это гарантирует, что AI всегда видит актуальную статистику, а не устаревшие
+данные.
 
 ### Механизм 2: Агрессивные описания тулзов
 
@@ -1073,6 +1086,8 @@ bun run dev
 code-shadow/
 ├── src/
 │   ├── index.ts              # Точка входа плагина — экспорт CodeShadow
+│   ├── v2.ts                 # Адаптер OpenCode 2: hooks/events → V1-ядро
+│   ├── tui-v2.ts             # Адаптер V2 TUI: ui.slot → slots.register
 │   ├── observer.ts           # Observer Engine: 12 обработчиков + Auto-Memory
 │   ├── storage.ts            # Storage Engine: SQLite/WAL, миграции, CRUD + batch
 │   ├── tui.ts                # TUI-интеграция: /shadow, toast, контекст
@@ -1112,6 +1127,7 @@ code-shadow/
 │   ├── IMPLEMENTATION_PLAN.md
 │   ├── ROADMAP.md
 │   ├── TOOLS_API.md
+│   ├── V2_COMPATIBILITY.md
 │   └── IMPLEMENTATION_STATUS.md
 ├── package.json
 ├── tsconfig.json
@@ -1152,6 +1168,7 @@ code-shadow/
 | [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) | План реализации: фазы, критерии, риски |
 | [ROADMAP.md](docs/ROADMAP.md) | Дорожная карта развития продукта |
 | [TOOLS_API.md](docs/TOOLS_API.md) | API спецификация всех AI-инструментов |
+| [V2_COMPATIBILITY.md](docs/V2_COMPATIBILITY.md) | OpenCode 2: события, упаковка, TUI, AGENTS.md |
 
 ---
 

@@ -27,8 +27,58 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const pluginDir = join(__dirname, "..")
 
 // ---------------------------------------------------------------------------
-// Управление CRUSH.md — автономные инструкции для AI
+// Управление инструкциями AI: CRUSH.md (legacy) + AGENTS.md (OpenCode 2)
 // ---------------------------------------------------------------------------
+
+const INSTRUCTION_START_MARKER = "<!-- CODE_SHADOW_START -->"
+const INSTRUCTION_END_MARKER = "<!-- CODE_SHADOW_END -->"
+
+/**
+ * Записывает блок Code Shadow в файл инструкций, сохраняя пользовательский
+ * текст вне маркеров. Повторный вызов не дублирует блок: существующий блок
+ * заменяется целиком.
+ */
+function upsertInstructionBlock(
+  filePath: string,
+  block: string,
+  log: ReturnType<typeof createLogger>,
+): boolean {
+  let existing = ""
+  try {
+    existing = fs.readFileSync(filePath, "utf-8")
+  } catch {
+    // Файла нет — создадим ниже.
+  }
+
+  const startIdx = existing.indexOf(INSTRUCTION_START_MARKER)
+  const endIdx =
+    startIdx === -1
+      ? -1
+      : existing.indexOf(INSTRUCTION_END_MARKER, startIdx + INSTRUCTION_START_MARKER.length)
+
+  let updated: string
+  if (startIdx === -1) {
+    const prefix = existing.trim().length === 0 ? "" : existing.trimEnd() + "\n\n"
+    updated = `${prefix}${block}\n`
+  } else if (endIdx === -1) {
+    // Блок повреждён (нет закрывающего маркера) — заменяем до конца файла.
+    updated = `${existing.substring(0, startIdx)}${block}\n`
+  } else {
+    updated = `${existing.substring(0, startIdx)}${block}${existing.substring(
+      endIdx + INSTRUCTION_END_MARKER.length,
+    )}`
+  }
+
+  if (updated === existing) {
+    log.debug(`Инструкции Code Shadow без изменений: ${filePath}`)
+    return false
+  }
+
+  const dir = dirname(filePath)
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(filePath, updated, "utf-8")
+  return true
+}
 
 // ---------------------------------------------------------------------------
 // Авто-установка TUI-плагина — копирует tui-plugin.tsx и создаёт tui.json
@@ -65,6 +115,9 @@ async function ensureTuiPlugin(pluginDir: string, log: ReturnType<typeof createL
       try {
         const parsed = JSON.parse(fs.readFileSync(tuiConfigPath, "utf-8")) as { plugin?: unknown }
         const plugins = Array.isArray(parsed.plugin) ? parsed.plugin : []
+        // postinstall installs the V2 adapter; do not add the V1 panel next to
+        // it (two entries would render two sidebars).
+        if (plugins.includes("./plugins/code-shadow/tui-v2.ts")) return
         if (!plugins.includes(entry)) {
           parsed.plugin = [...plugins, entry]
           fs.writeFileSync(tuiConfigPath, JSON.stringify(parsed, null, 2) + "\n", "utf-8")
@@ -80,8 +133,6 @@ async function ensureTuiPlugin(pluginDir: string, log: ReturnType<typeof createL
 }
 
 async function ensureCrushMd(storage: StorageEngine, config: ShadowConfig, log: ReturnType<typeof createLogger>): Promise<void> {
-  const crushPath = resolvePath("~/.config/opencode/CRUSH.md")
-
   let sessionCount = 0
   let fileCount = 0
   let knowledgeCount = 0
@@ -177,7 +228,7 @@ ${lastSession ? `- **Последняя сессия**: ${lastSession.agent_type
 <!-- CODE_SHADOW_START -->
 ## Code Shadow — Автономный анализ проекта
 
-> Управляется плагином автоматически. Обновлено: ${new Date().toISOString()}
+> Управляется плагином автоматически.
 > Проектов: ${projects.length} | Сессий: ${sessionCount} | Правок: ${fileCount} | Фактов: ${knowledgeCount} | Ошибок: ${errorCount}
 
 ### Обязательные правила (БЕЗ команды)
@@ -229,34 +280,23 @@ ${projectSections}${knowledgeSummary}
 <!-- CODE_SHADOW_END -->
 `
 
-  try {
-    let existing = ""
+  // Один и тот же блок пишем в два файла:
+  // - CRUSH.md — обратная совместимость с OpenCode 1;
+  // - AGENTS.md — глобальные инструкции OpenCode 2 (CRUSH.md он не читает).
+  const instructionTargets = [
+    resolvePath("~/.config/opencode/CRUSH.md"),
+    resolvePath("~/.config/opencode/AGENTS.md"),
+  ]
+
+  const block = shadowSection.trim()
+  for (const targetPath of instructionTargets) {
+    const fileName = targetPath.split(/[\\/]/).pop() || targetPath
     try {
-      existing = fs.readFileSync(crushPath, "utf-8")
-    } catch {
-      // File doesn't exist — will be created
+      const changed = upsertInstructionBlock(targetPath, block, log)
+      if (changed) log.info(`${fileName} обновлён (проектов: ${projects.length})`)
+    } catch (err) {
+      log.error(`Ошибка управления ${fileName}: ${String(err)}`)
     }
-
-    const startMarker = "<!-- CODE_SHADOW_START -->"
-    const endMarker = "<!-- CODE_SHADOW_END -->"
-    const startIdx = existing.indexOf(startMarker)
-    const endIdx = existing.indexOf(endMarker)
-
-    if (startIdx === -1) {
-      const updated = existing.trimEnd() + "\n\n" + shadowSection.trim() + "\n"
-      const dir = dirname(crushPath)
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-      fs.writeFileSync(crushPath, updated, "utf-8")
-      log.info(`CRUSH.md обновлён (проектов: ${projects.length})`)
-    } else {
-      const before = existing.substring(0, startIdx)
-      const after = existing.substring(endIdx + endMarker.length)
-      const updated = before + shadowSection.trim() + after
-      fs.writeFileSync(crushPath, updated, "utf-8")
-      log.info(`CRUSH.md обновлён (проектов: ${projects.length})`)
-    }
-  } catch (err) {
-    log.error(`Ошибка управления CRUSH.md: ${String(err)}`)
   }
 }
 
@@ -264,7 +304,10 @@ ${projectSections}${knowledgeSummary}
 // Code Shadow Plugin
 // ---------------------------------------------------------------------------
 
-export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
+export const CodeShadow = async (
+  ctx: Parameters<Plugin>[0],
+  options?: { skipTuiAutoInstall?: boolean },
+) => {
   const log = createLogger("core")
 
   // =========================================================================
@@ -324,13 +367,17 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
     }
   }, 6 * 60 * 60 * 1000)
 
-  // CRUSH.md refresh — проверяем каждые 10 секунд, обновляем только если данные изменились
+  // Инструкции Code Shadow (CRUSH.md + AGENTS.md) — проверяем каждые 10 секунд,
+  // записываем не чаще одного раза в 3 минуты
   let crushChecksSinceRefresh = 0
   const crushInterval = setInterval(async () => {
     try {
       crushChecksSinceRefresh++
       const obsAny = observerHooks as any
-      const shouldRefresh = (obsAny.isCrushDirty && obsAny.isCrushDirty?.()) || crushChecksSinceRefresh >= 18 // 18 * 10s = 3 min
+      // AGENTS.md is a live OpenCode 2 instruction source: writing it on every
+      // observer event would inject a new instruction update every 10 seconds.
+      // Refresh at most once per 3 minutes; startup already writes the block.
+      const shouldRefresh = crushChecksSinceRefresh >= 18 // 18 * 10s = 3 min
       if (shouldRefresh) {
         await ensureCrushMd(storage, config, log)
         obsAny.clearCrushDirty?.()
@@ -342,7 +389,7 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
   }, 10000)
 
   // =========================================================================
-  // 4.1. CRUSH.md — автономные инструкции для AI
+  // 4.1. CRUSH.md + AGENTS.md — автономные инструкции для AI
   // =========================================================================
 
   try {
@@ -355,10 +402,12 @@ export const CodeShadow = async (ctx: Parameters<Plugin>[0]) => {
   // 4.2. Авто-установка TUI-плагина
   // =========================================================================
 
-  try {
-    await ensureTuiPlugin(pluginDir, log)
-  } catch (err) {
-    log.error(`Ошибка ensureTuiPlugin: ${String(err)}`)
+  if (!options?.skipTuiAutoInstall) {
+    try {
+      await ensureTuiPlugin(pluginDir, log)
+    } catch (err) {
+      log.error(`Ошибка ensureTuiPlugin: ${String(err)}`)
+    }
   }
 
   // =========================================================================

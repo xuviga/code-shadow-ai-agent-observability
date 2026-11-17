@@ -11,6 +11,7 @@ import type { ShadowConfig } from "./types"
 import { NodeType } from "./types"
 import { sanitizeContent } from "./config"
 import { pathMatches } from "./path-match"
+import { normalizeProjectPath } from "./project-path"
 import type { createLogger } from "./logger"
 import * as path from "node:path"
 
@@ -22,7 +23,7 @@ import * as path from "node:path"
 
 interface StorageEngineLike {
   // Sessions
-  insertSession(session: any): void
+  insertSession(session: any): boolean
   updateSessionStatus(id: string, status: string, extra?: any): void
   getSession(id: string): any | undefined
 
@@ -60,6 +61,8 @@ interface StorageEngineLike {
   addTaskStep(input: any): any
   updateTask(id: string, patch: any): any
   listTasks(projectRoot: string, status?: string, limit?: number): any[]
+  getActiveTaskForSession(sessionId: string): any | undefined
+  getOpenTaskForSession(sessionId: string): any | undefined
   recordEvidence(input: any): any
 }
 
@@ -737,6 +740,13 @@ export function createObserver(
   /** Message IDs already counted into session metrics (message.updated fires repeatedly). */
   const countedMessages = new Set<string>()
 
+  /** Per-session turn counter for `turn_completed` metadata. */
+  const turnCounts = new Map<string, number>()
+
+  /** Last completed turn boundary and cumulative counts, for per-turn deltas. */
+  const lastTurnEndAt = new Map<string, number>()
+  const lastTurnTotals = new Map<string, { files: number; tools: number; errors: number }>()
+
   /** Last successful agent mutation per normalized file path (human-fix heuristic). */
   const recentAgentEdits = new Map<string, number>()
 
@@ -858,14 +868,15 @@ export function createObserver(
   // chat.message — automatic Task Graph bootstrap from a user request
   // =========================================================================
 
-  function inferTaskPlan(text: string): string[] {
-    const steps = ["Изучить релевантный код и контекст проекта"]
-    if (/(fix|bug|debug|исправ|ошиб|баг)/i.test(text)) steps.push("Воспроизвести проблему и найти root cause")
-    if (/(api|auth|database|db|schema|архитект|интеграц|endpoint|авторизац|баз[аы] данн)/i.test(text)) steps.push("Проверить затронутые границы, зависимости и исторический риск")
-    steps.push("Реализовать изменение в пределах Change Contract")
-    if (/(test|тест|провер|regression|регрес)/i.test(text)) steps.push("Добавить или обновить regression tests")
-    steps.push("Запустить verification-команды и записать verified evidence")
-    return Array.from(new Set(steps))
+  /**
+   * Auto-Task is a reminder, not a full plan. The old heuristic always created
+   * five or six steps, which made Definition of Done unreachable unless the
+   * agent manually closed every synthetic step. Keep one actionable step; the
+   * agent can add more with code_shadow_task action="add_step" when the request
+   * actually needs a plan.
+   */
+  function inferTaskPlan(_text: string): string[] {
+    return ["Выполнить запрос пользователя"]
   }
 
   async function handleChatMessage(
@@ -893,8 +904,9 @@ export function createObserver(
       const actionable = /\b(fix|implement|add|remove|update|refactor|create|build|write|test|debug|check|исправ|реализ|добав|удал|обнов|рефактор|созд|собер|напиш|проверь|сделай)\w*/i.test(text)
       if (!actionable && text.length < 80) return
 
-      const existing = storage.listTasks(session.projectRoot, "active", 10)
-        .find((task) => task.sessionId === input.sessionID)
+      // One open auto-task per session. A direct lookup is not limited by
+      // listTasks' recent-10 window, so an old task cannot be bypassed.
+      const existing = storage.getOpenTaskForSession(input.sessionID)
       if (existing) return
 
       const title = (text.split(/[.!?\n]/)[0] || text).slice(0, 120).trim()
@@ -958,7 +970,7 @@ export function createObserver(
             event_type: "tool_rejected",
             session_id: input.sessionID,
             file_path: violations[0],
-            metadata: JSON.stringify({ reason: "change_contract_permission_denied", permission_id: input.id, contract_id: contract.id, tool: input.type, violations }),
+            metadata: JSON.stringify({ reason: "change_contract_permission_denied", blocking: true, severity: "critical", permission_id: input.id, contract_id: contract.id, tool: input.type, violations }),
             timestamp: Date.now(),
           })
           log.warn(`Change Contract hard-gate: permission denied for ${violations.join(", ")}, contract=${contract.id}`)
@@ -1044,7 +1056,7 @@ export function createObserver(
       if (!isShellTool && !hasExplicitCommand) return
       const command = extractCommand(args)
       if (!command || !isVerificationCommand(command)) return
-      const activeTask = storage.listTasks(session.projectRoot, "active", 1)[0]
+      const activeTask = storage.getActiveTaskForSession(sessionId)
       const successful = status === "success" && !outputIndicatesFailure(resultOutput)
       storage.recordEvidence({
         projectRoot: session.projectRoot,
@@ -1083,9 +1095,9 @@ export function createObserver(
     if (state.count === 3) {
       const session = storage.getSession(sessionId)
       if (!session) return
-      const activeTask = storage.listTasks(session.projectRoot, "active", 1)[0]
+      const activeTask = storage.getActiveTaskForSession(sessionId)
       storage.getDb().prepare(`INSERT INTO developer_events (event_type, session_id, file_path, metadata, timestamp) VALUES (?1,?2,NULL,?3,?4)`).run(
-        "tool_rejected", sessionId, JSON.stringify({ reason: "agent_loop_detected", tool: toolName, signature: argsPreview, repeats: state.count }), Date.now(),
+        "tool_warning", sessionId, JSON.stringify({ reason: "agent_loop_detected", blocking: false, severity: "warning", tool: toolName, signature: argsPreview, repeats: state.count }), Date.now(),
       )
       log.warn(`Agent loop detected: ${toolName} повторён 3 раза с ошибкой; task=${activeTask?.id || "none"}`)
     }
@@ -1114,6 +1126,7 @@ export function createObserver(
     sessionId: string,
     filePath: string,
     args: Record<string, unknown>,
+    projectRoot = "",
   ): SuccessfulEditLoopState {
     const now = Date.now()
     const key = successfulEditLoopKey(sessionId, filePath)
@@ -1134,16 +1147,24 @@ export function createObserver(
     }
     const fingerprint = getEditFingerprint(toolName, args)
     if (fingerprint) state.fingerprints.set(fingerprint, (state.fingerprints.get(fingerprint) || 0) + 1)
+    // V2 watcher paths are absolute; store the same canonical form so a later
+    // external change can be recognized as human_fix. Keep the raw form too so
+    // a V1 host that reports relative watcher paths still matches.
     rememberBounded(recentAgentEdits, normalizeTrackedPath(filePath), now)
+    if (projectRoot) {
+      rememberBounded(recentAgentEdits, normalizeTrackedPath(normalizeProjectPath(projectRoot, filePath)), now)
+    }
 
     if (state.count === SUCCESSFUL_EDIT_LOOP_WARNING_COUNT && !state.warned) {
       state.warned = true
       storage.enqueue("developer_events", {
-        event_type: "tool_rejected",
+        event_type: "tool_warning",
         session_id: sessionId,
         file_path: filePath,
         metadata: JSON.stringify({
           reason: "successful_edit_loop_warning",
+          blocking: false,
+          severity: "warning",
           tool: toolName,
           file: filePath,
           repeats: state.count,
@@ -1174,6 +1195,8 @@ export function createObserver(
       file_path: filePath,
       metadata: JSON.stringify({
         reason: "successful_edit_loop_blocked",
+        blocking: true,
+        severity: "error",
         tool: toolName,
         file: filePath,
         repeats: state.count,
@@ -1338,8 +1361,10 @@ export function createObserver(
       currentSessionId = sessionId
       crushDirty = true
 
-      // Вставка сессии со статусом 'created' — используем РЕАЛЬНЫЙ метод insertSession
-      storage.insertSession({
+      // Вставка сессии со статусом 'created' — используем РЕАЛЬНЫЙ метод insertSession.
+      // Multiple workspace plugin instances receive the same global event; only
+      // the instance that actually created the row may emit session_started.
+      const created = storage.insertSession({
         id: sessionId,
         agentType,
         status: "created",
@@ -1354,6 +1379,10 @@ export function createObserver(
         totalTokensUsed: 0,
         compactedFrom: null,
       })
+      if (!created) {
+        log.debug(`session.created: сессия ${sessionId} уже записана другим экземпляром`)
+        return
+      }
 
       // Вставка developer event (тип: 'session_started')
       storage.enqueue("developer_events", {
@@ -1396,8 +1425,38 @@ export function createObserver(
   }
 
   // =========================================================================
-  // 3. session.idle — завершение сессии
+  // 3. session.idle — завершение хода
   // =========================================================================
+
+  /**
+   * `session.idle` can arrive before `execution.interrupted`; in that case the
+   * turn event already exists without the flag. Patch only the latest turn.
+   */
+  function markLatestTurnInterrupted(sessionId: string, reason: string | null): void {
+    try {
+      const db = storage.getDb()
+      const row = db.prepare(
+        `SELECT id, metadata FROM developer_events
+         WHERE session_id = ?1 AND event_type = 'turn_completed'
+         ORDER BY timestamp DESC, id DESC LIMIT 1`,
+      ).get(sessionId) as { id: number; metadata: string | null } | undefined
+      if (!row) return
+      let metadata: Record<string, unknown> = {}
+      try {
+        metadata = row.metadata ? JSON.parse(row.metadata) : {}
+      } catch {
+        metadata = {}
+      }
+      metadata.interrupted = true
+      metadata.interrupt_reason = reason
+      db.prepare(`UPDATE developer_events SET metadata = ?1 WHERE id = ?2`).run(
+        JSON.stringify(metadata),
+        row.id,
+      )
+    } catch (err) {
+      log.debug(`Не удалось обновить interrupted-маркер: ${String(err)}`)
+    }
+  }
 
   async function handleSessionIdle(properties: Record<string, unknown>): Promise<void> {
     try {
@@ -1409,6 +1468,15 @@ export function createObserver(
 
       const endedAt = Date.now()
 
+      // Interrupted V2 turns are still idle turns; the marker only lets
+      // analytics separate them from a normal completion.
+      const interrupted = properties.interrupted === true
+      const rawInterruptReason = properties.reason
+      const interruptReason =
+        interrupted && typeof rawInterruptReason === "string" && rawInterruptReason.length > 0
+          ? rawInterruptReason
+          : null
+
       // Получаем текущую запись сессии — используем РЕАЛЬНЫЙ метод getSession
       const session = storage.getSession(sessionId)
       if (!session) {
@@ -1416,6 +1484,12 @@ export function createObserver(
         return
       }
       if (session.status === "idle" && session.endedAt) {
+        // The host may deliver a normal session.idle before execution.interrupted.
+        // Preserve the interruption marker on the already-written turn.
+        if (interrupted) {
+          storage.flushBatch()
+          markLatestTurnInterrupted(sessionId, interruptReason)
+        }
         log.debug(`session.idle: дубликат для ${sessionId} пропущен`)
         return
       }
@@ -1439,25 +1513,72 @@ export function createObserver(
         "SELECT COUNT(*) as cnt FROM session_errors WHERE session_id = ?"
       ).get(sessionId) as { cnt: number } | undefined
 
+      const totalFiles = filesCount?.cnt ?? 0
+      const totalTools = toolsCount?.cnt ?? 0
+      const totalErrors = errorsCount?.cnt ?? 0
+
+      // The plugin can reload between turns (opencode reload). In that case the
+      // in-memory maps are empty; recover the previous turn boundary, totals and
+      // index from the latest turn_completed row.
+      const lastTurnRow = db.prepare(
+        `SELECT timestamp, metadata FROM developer_events
+         WHERE session_id = ?1 AND event_type = 'turn_completed'
+         ORDER BY timestamp DESC, id DESC LIMIT 1`,
+      ).get(sessionId) as { timestamp: number; metadata: string | null } | undefined
+      let lastTurnMetadata: Record<string, unknown> = {}
+      if (lastTurnRow?.metadata) {
+        try {
+          lastTurnMetadata = JSON.parse(lastTurnRow.metadata) as Record<string, unknown>
+        } catch {
+          lastTurnMetadata = {}
+        }
+      }
+      const previousTotals = lastTurnTotals.get(sessionId) ?? {
+        files: Number(lastTurnMetadata.files_changed_total) || 0,
+        tools: Number(lastTurnMetadata.tools_used_total) || 0,
+        errors: Number(lastTurnMetadata.errors_total) || 0,
+      }
+      const turnFiles = Math.max(0, totalFiles - previousTotals.files)
+      const turnTools = Math.max(0, totalTools - previousTotals.tools)
+      const turnErrors = Math.max(0, totalErrors - previousTotals.errors)
+      const turnStartedAt = lastTurnEndAt.get(sessionId) ?? lastTurnRow?.timestamp ?? startedAt
+      const turnDuration = Math.max(0, endedAt - turnStartedAt)
+      const lastTurnIndex = Number(lastTurnMetadata.turn_index) || 0
+      const turnIndex = Math.max(turnCounts.get(sessionId) ?? 0, lastTurnIndex) + 1
+      turnCounts.set(sessionId, turnIndex)
+      lastTurnEndAt.set(sessionId, endedAt)
+      lastTurnTotals.set(sessionId, { files: totalFiles, tools: totalTools, errors: totalErrors })
+
       // Обновление сессии — используем РЕАЛЬНЫЙ метод updateSessionStatus
       storage.updateSessionStatus(sessionId, "idle", {
         endedAt,
         durationMs: duration,
-        filesChangedCount: filesCount?.cnt ?? 0,
-        toolsUsedCount: toolsCount?.cnt ?? 0,
-        errorsCount: errorsCount?.cnt ?? 0,
+        filesChangedCount: totalFiles,
+        toolsUsedCount: totalTools,
+        errorsCount: totalErrors,
       })
 
-      // Вставка developer event (тип: 'session_completed')
+      // A session can resume after idle, so idle means "turn completed", not
+      // "session completed". `session_completed` is legacy; terminal states
+      // emit `session_end` (compacted/deleted), and `turn_completed` is the
+      // per-turn metric consumers should use.
       storage.enqueue("developer_events", {
-        event_type: "session_completed",
+        event_type: "turn_completed",
         session_id: sessionId,
         file_path: null,
         metadata: JSON.stringify({
-          duration_ms: duration,
-          files_changed: filesCount?.cnt ?? 0,
-          tools_used: toolsCount?.cnt ?? 0,
-          errors: errorsCount?.cnt ?? 0,
+          kind: "turn",
+          turn_index: turnIndex,
+          duration_ms: turnDuration,
+          session_duration_ms: duration,
+          files_changed: turnFiles,
+          tools_used: turnTools,
+          errors: turnErrors,
+          files_changed_total: totalFiles,
+          tools_used_total: totalTools,
+          errors_total: totalErrors,
+          interrupted,
+          interrupt_reason: interruptReason,
         }),
         timestamp: endedAt,
       })
@@ -1750,7 +1871,17 @@ export function createObserver(
       if (!sessionId) return
       if (storage.getSession(sessionId)) {
         storage.updateSessionStatus(sessionId, "deleted")
+        storage.enqueue("developer_events", {
+          event_type: "session_end",
+          session_id: sessionId,
+          file_path: null,
+          metadata: JSON.stringify({ reason: "deleted" }),
+          timestamp: Date.now(),
+        })
       }
+      turnCounts.delete(sessionId)
+      lastTurnEndAt.delete(sessionId)
+      lastTurnTotals.delete(sessionId)
       if (currentSessionId === sessionId) currentSessionId = ""
       crushDirty = true
     } catch (err) {
@@ -2062,10 +2193,10 @@ export function createObserver(
                 const violation = forbidden.some((pattern) => pathMatches(pattern, target, session.projectRoot)) || (allowed.length > 0 && !allowed.some((pattern) => pathMatches(pattern, target, session.projectRoot)))
                 if (violation) {
                   storage.enqueue("developer_events", {
-                    event_type: "tool_rejected",
+                    event_type: "tool_warning",
                     session_id: sessionId,
                     file_path: target,
-                    metadata: JSON.stringify({ reason: "change_contract_preflight", contract_id: contract.id, tool: toolName }),
+                    metadata: JSON.stringify({ reason: "change_contract_preflight", blocking: false, severity: "warning", contract_id: contract.id, tool: toolName }),
                     timestamp: Date.now(),
                   })
                   log.warn(`Preflight Change Contract warning: ${toolName} → ${target}, contract=${contract.id}`)
@@ -2129,7 +2260,14 @@ export function createObserver(
 
       // Извлечение целевых файлов (включая multi-file patch)
       const mutatingTargets = extractMutatingTargets(args)
-      const targetFile: string | null = mutatingTargets[0] ?? null
+      // Paths in tool args are often relative, while V2 step/watcher events are
+      // absolute. Store one canonical absolute target so analytics can join
+      // tool_executions with file_edits; guards keep using the raw targets.
+      const session = storage.getSession(sessionId)
+      const projectRoot = (session?.projectRoot as string) || ""
+      const targetFile: string | null = mutatingTargets[0]
+        ? normalizeProjectPath(projectRoot, mutatingTargets[0])
+        : null
 
       // Обрезка аргументов до config.maxArgsPreviewChars
       const argsStr = JSON.stringify(args)
@@ -2161,7 +2299,6 @@ export function createObserver(
       })
 
       // Auto-Memory: обнаружение фактов из результатов инструментов (project-scoped)
-      const projectRoot = storage.getSession(sessionId)?.projectRoot || ""
       void autoDetectFromToolResult(toolName, args, resultOutput, storage, log, projectRoot)
 
       // Verification commands become Evidence Ledger records automatically.
@@ -2169,7 +2306,7 @@ export function createObserver(
       inspectToolLoop(toolName, sessionId, safeArgsPreview, status)
       if (status === "success" && isMutatingFileTool(toolName)) {
         for (const target of mutatingTargets) {
-          recordSuccessfulEdit(toolName, sessionId, target, args)
+          recordSuccessfulEdit(toolName, sessionId, target, args, projectRoot)
         }
       }
 

@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { StorageEngine } from "../src/storage"
 import { extractImportSpecifiers, indexImports } from "../src/import-graph"
 import { createAnalyzeTool } from "../src/tools/analyze"
-import { EdgeType } from "../src/types"
+import { EdgeType, NodeType } from "../src/types"
 
 const databases: Array<{ storage: StorageEngine; directory: string }> = []
 
@@ -65,7 +65,7 @@ describe("import graph", () => {
     expect(rootId).toBeGreaterThan(0)
 
     const root = storage.searchNodes("a.ts", 10, directory)[0]
-    expect(root.nodeType).toBe("file")
+    expect(root.nodeType).toBe(NodeType.File)
     expect(root.projectRoot).toBe(directory)
 
     const edges = storage.getEdgesForNode(root.id).filter((edge) => edge.edgeType === EdgeType.Imports)
@@ -74,7 +74,7 @@ describe("import graph", () => {
 
     const react = storage.searchNodes("react", 10, directory).find((node) => node.nodeType === "module")
     expect(react).toBeTruthy()
-    expect(storage.searchNodes("b.ts", 10, directory)[0].nodeType).toBe("file")
+    expect(storage.searchNodes("b.ts", 10, directory)[0].nodeType).toBe(NodeType.File)
   })
 
   test("dependency_graph returns indexed imports with node types", async () => {
