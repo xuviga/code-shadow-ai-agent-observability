@@ -85,6 +85,7 @@ preventing normal iterative bug fixing.
 | [Data Model](docs/DATA_MODEL.md) | SQLite entities and relationships |
 | [Implementation status](docs/IMPLEMENTATION_STATUS.md) | What is implemented and how it is verified |
 | [V2 compatibility](docs/V2_COMPATIBILITY.md) | OpenCode 2 events, packaging, TUI and AGENTS.md |
+| [Landscape](docs/LANDSCAPE.md) | What already exists in the world for these agent pain points, and where Code Shadow honestly stands |
 | [Upgrading](docs/UPGRADE.md) | Reload, doctor, lockfile and V1 package-root migration |
 | [Roadmap](docs/ROADMAP.md) | Planned product direction |
 | [Contributing](CONTRIBUTING.md) | Development workflow and pull-request standards |
