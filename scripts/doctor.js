@@ -227,10 +227,10 @@ async function checkDatabase() {
     }
 
     if (schemaChecked) {
-      if (Number.isInteger(schemaVersion) && schemaVersion >= 12) {
-        pass(`shadow DB schema version is ${schemaVersion} (expected >= 12)`)
+      if (Number.isInteger(schemaVersion) && schemaVersion >= 13) {
+        pass(`shadow DB schema version is ${schemaVersion} (expected >= 13)`)
       } else {
-        fail(`shadow DB schema version is ${schemaVersion ?? "missing"}, expected >= 12`)
+        fail(`shadow DB schema version is ${schemaVersion ?? "missing"}, expected >= 13`)
       }
     }
 

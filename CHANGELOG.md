@@ -6,7 +6,13 @@ All notable changes to Code Shadow are documented here.
 
 ### Added
 
-- OpenCode 2 telemetry through `src/v2.ts`: 13 subscribed events, including
+- **Proof-Carrying Change**: `code_shadow_passport` (17th tool) seals each
+  change with intent, file hashes, almost-right findings, Change Contract,
+  verified evidence, destructive-command checks, file claims, token budget,
+  a `prev_hash` chain and a review Markdown packet. Definition of Done requires
+  a sealed passport when one exists; destructive shell commands are blocked
+  unless a passport explicitly sets `allow_destructive`.
+- OpenCode 2 telemetry through `src/v2.ts`: 14 subscribed events, including
   `session.execution.succeeded` / `session.execution.interrupted` as turn
   completion and `session.step.ended.files` mapped to `file.edited` with
   per-session attribution; `V2StepUsageBuffer` emits one summed

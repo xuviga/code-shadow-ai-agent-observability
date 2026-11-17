@@ -257,8 +257,8 @@ describe("v2 plugin setup", () => {
       expect(typeof dispose).toBe("function")
 
       const toolNames = [...tools.keys()]
-      expect(toolNames).toHaveLength(16)
-      expect(toolNames.filter((id) => id.startsWith("code_shadow_"))).toHaveLength(16)
+      expect(toolNames).toHaveLength(17)
+      expect(toolNames.filter((id) => id.startsWith("code_shadow_"))).toHaveLength(17)
       expect(state.subscribedTypes).toHaveLength(14)
       expect(state.subscribedTypes).toContain("session.execution.succeeded")
       expect(state.subscribedTypes).toContain("session.execution.interrupted")

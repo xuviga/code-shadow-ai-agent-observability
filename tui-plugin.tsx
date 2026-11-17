@@ -187,6 +187,7 @@ type Snapshot = {
   failures: number
   contracts: number
   adrs: number
+  passport: { status: string; risk: number; findings: number } | null
   todaySessions: number
   todayEdits: number
   todayErrors: number
@@ -212,7 +213,7 @@ function emptySnapshot(): Snapshot {
   return {
     project: "", branch: "", worktree: "", sessions: 0, activeSessions: 0, edits: 0, files: 0,
     errors: 0, tools: 0, memory: 0, tasks: 0, evidence: 0, failures: 0,
-    contracts: 0, adrs: 0, todaySessions: 0, todayEdits: 0, todayErrors: 0,
+    contracts: 0, adrs: 0, passport: null, todaySessions: 0, todayEdits: 0, todayErrors: 0,
     hotspots: [], activity: [], touched: [], sessionId: "", sessionAgent: "", sessionModel: "",
     sessionMessages: 0, sessionTokens: 0, sessionCost: 0, sessionStarted: 0,
     sessionStatus: "unknown", changes: [], changeSummary: null, todos: [],
@@ -627,6 +628,12 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
             "SELECT COUNT(*) FROM decisions WHERE project_root = ?1 OR project_root IS NULL",
             root,
           )
+          const passport = query<{ status: string; risk_score: number; findings: number }>(
+            `SELECT status, risk_score, json_array_length(findings) AS findings
+             FROM change_passports WHERE project_root = ?1
+             ORDER BY created_at DESC LIMIT 1`,
+            root,
+          )[0] ?? null
           const todaySessions = scalar(
             "SELECT COUNT(*) FROM sessions WHERE project_root = ?1 AND started_at >= ?2",
             root, day,
@@ -832,6 +839,9 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
             files: Math.max(files, toolFiles, changeSummary?.files ?? 0),
             errors, tools, memory, tasks,
             evidence, failures, contracts, adrs,
+            passport: passport
+              ? { status: passport.status, risk: Number(passport.risk_score) || 0, findings: Number(passport.findings) || 0 }
+              : null,
             todaySessions, todayEdits: Math.max(todayEdits, todayEditTools), todayErrors,
             hotspots, activity, touched, worktree,
             sessionId: sid,
@@ -1053,6 +1063,20 @@ function createStatsPanel(api: TuiPluginApi): TuiSlotPlugin {
             </box>
             {state.failures > 0 ? (
               <KV s={s} label="failures" value={String(state.failures)} color={s.error} />
+            ) : null}
+            {state.passport ? (
+              <KV
+                s={s}
+                label="passport"
+                value={`${state.passport.status} · risk ${state.passport.risk} · ${state.passport.findings} findings`}
+                color={
+                  state.passport.status === "sealed"
+                    ? s.success
+                    : state.passport.status === "blocked"
+                      ? s.error
+                      : s.warning
+                }
+              />
             ) : null}
 
             {/* ── Hotspots ── */}

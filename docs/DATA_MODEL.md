@@ -1,6 +1,6 @@
 # Модель данных Code Shadow
 
-> Актуально на v0.5.3 (17.11.2026). Источник правды — `src/migrations/001…012`
+> Актуально на v0.5.3 (17.11.2026). Источник правды — `src/migrations/001…013`
 > и `src/types.ts`. SQLite-файл по умолчанию:
 > `~/.config/opencode/shadow/data.db` (WAL).
 
@@ -26,6 +26,7 @@
 | 010 | `010_knowledge_node_natural_key.ts` | natural-key UNIQUE `knowledge_nodes` + перепривязка рёбер |
 | 011 | `011_knowledge_fts.ts` | FTS5-индекс `knowledge_nodes_fts` + триггеры |
 | 012 | `012_event_taxonomy.ts` | `tool_warning` и `turn_completed`; разделение блокирующих и advisory-событий |
+| 013 | `013_change_passports.ts` | `change_passports` (Proof-Carrying Change) и `file_claims` (multi-agent ownership) |
 
 ## 2. Сырая телеметрия
 
@@ -130,6 +131,8 @@ tested_by|implements|extends|coupled_with|references`), `weight`,
 | `contradiction_records` | `id TEXT PK`, `project_root`, `task_id FK SET NULL`, `claim_a/source_a`, `claim_b/source_b`, `severity`, `resolution`, timestamps | `open/resolved/accepted`; severity `low/medium/high/critical` |
 | `provenance_events` | `id INTEGER PK AI`, `project_root`, `session_id`, `source_type` (`user/system/file/tool_output/memory/external`), `source_ref`, `content_hash`, `trust_level` (`system/user/verified/observed/untrusted`), `flags` JSON, `snippet` | — |
 | `agent_handoffs` | `id TEXT PK`, `project_root`, `task_id FK SET NULL`, `session_id`, `summary`, `next_action`, `payload` JSON, timestamps | `open/claimed/completed` |
+| `change_passports` | `id TEXT PK`, `project_root`, `session_id`, `task_id`, `contract_id`, `intent`, `status`, `risk_score/level`, `files`/`evidence_ids`/`checks`/`findings` JSON, `budget_tokens`, `tokens_used`, `allow_destructive`, `agent`, `model`, `base_ref`, `rollback_plan`, `review_md`, `hash`, `prev_hash`, timestamps | `draft/sealed/blocked/superseded` |
+| `file_claims` | `id TEXT PK`, `project_root`, `file_path`, `session_id`, `agent`, `status`, `note`, `created_at`, `expires_at`, `released_at` | `active/released/expired`; partial UNIQUE на active `(project_root,file_path)` |
 
 Индексы: `(project_root,status,updated_at)` для tasks/contracts,
 `(task_id,position)`, `(project_root,task_id,created_at)` для evidence,

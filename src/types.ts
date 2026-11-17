@@ -428,6 +428,92 @@ export interface AgentHandoff {
 }
 
 // ---------------------------------------------------------------------------
+// Change Passport и File Claims
+// ---------------------------------------------------------------------------
+
+/** Статус паспорта изменения — черновик, запечатан, заблокирован или заменён. */
+export type PassportStatus = "draft" | "sealed" | "blocked" | "superseded";
+
+/** Серьёзность находки в паспорте изменения. */
+export type PassportSeverity = "info" | "warning" | "error" | "critical";
+
+/** Итог проверки, приложенной к паспорту. */
+export type PassportCheckStatus = "pass" | "warn" | "fail";
+
+/** Изменённый файл в паспорте: тип правки, объём и хеш содержимого. */
+export interface PassportFile {
+  path: string;
+  editType: string;
+  linesAdded: number;
+  linesRemoved: number;
+  hash: string | null;
+}
+
+/** Находка (finding) паспорта: замечание к файлу/строке. */
+export interface PassportFinding {
+  kind: string;
+  severity: PassportSeverity;
+  file: string | null;
+  line: number | null;
+  message: string;
+}
+
+/** Проверка паспорта: id, человекочитаемая метка, статус и детали. */
+export interface PassportCheck {
+  id: string;
+  label: string;
+  status: PassportCheckStatus;
+  details: string | null;
+}
+
+/** change_passports — машино-проверяемый паспорт одного изменения агента. */
+export interface ChangePassport {
+  id: string;
+  projectRoot: string;
+  sessionId: string | null;
+  taskId: string | null;
+  contractId: string | null;
+  intent: string;
+  status: PassportStatus;
+  riskScore: number;
+  riskLevel: string;
+  files: PassportFile[];
+  evidenceIds: string[];
+  checks: PassportCheck[];
+  findings: PassportFinding[];
+  budgetTokens: number | null;
+  tokensUsed: number;
+  allowDestructive: boolean;
+  agent: string | null;
+  model: string | null;
+  baseRef: string | null;
+  rollbackPlan: string | null;
+  reviewMd: string | null;
+  hash: string | null;
+  prevHash: string | null;
+  createdAt: number;
+  updatedAt: number;
+  sealedAt: number | null;
+}
+
+/** Статус блокировки файла агентом. */
+export type FileClaimStatus = "active" | "released" | "expired";
+
+/** file_claims — блокировка файла для координации нескольких агентов. */
+export interface FileClaim {
+  id: string;
+  projectRoot: string;
+  filePath: string;
+  sessionId: string;
+  agent: string | null;
+  status: FileClaimStatus;
+  note: string | null;
+  createdAt: number;
+  expiresAt: number;
+  releasedAt: number | null;
+}
+
+// ---------------------------------------------------------------------------
 // Аналитические типы
 // ---------------------------------------------------------------------------
 
@@ -636,6 +722,8 @@ export interface ShadowConfig {
   disabledEventTypes: string[];
   /** Паттерны для фильтрации секретов из данных */
   secretPatterns: string[];
+  /** Как реагировать на разрушительные shell-команды: block (default) или warn. */
+  destructiveActionPolicy?: "block" | "warn";
 }
 
 /** Элемент очереди пакетной записи */

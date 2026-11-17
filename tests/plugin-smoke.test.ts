@@ -54,7 +54,7 @@ describe("plugin entrypoint smoke", () => {
     } as never)
 
     try {
-      expect(Object.keys(hooks.tool as Record<string, unknown>)).toHaveLength(16)
+      expect(Object.keys(hooks.tool as Record<string, unknown>)).toHaveLength(17)
       expect(typeof hooks.dispose).toBe("function")
 
       // Real SDK shape: session has no agent field.

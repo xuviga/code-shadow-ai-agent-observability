@@ -38,6 +38,11 @@ import type {
   ContradictionRecord,
   ProvenanceEvent,
   AgentHandoff,
+  ChangePassport,
+  FileClaim,
+  PassportCheck,
+  PassportFile,
+  PassportFinding,
 } from "./types";
 import { resolvePath } from "./config";
 import { createLogger } from "./logger";
@@ -53,6 +58,7 @@ import { migrateV009AnalyticsIndexes } from "./migrations/009_analytics_indexes"
 import { migrateV010KnowledgeNodeNaturalKey } from "./migrations/010_knowledge_node_natural_key";
 import { migrateV011KnowledgeFts } from "./migrations/011_knowledge_fts";
 import { migrateV012EventTaxonomy } from "./migrations/012_event_taxonomy";
+import { migrateV013ChangePassports } from "./migrations/013_change_passports";
 import { pathMatches } from "./path-match";
 
 // ---------------------------------------------------------------------------
@@ -461,6 +467,7 @@ export class StorageEngine {
       { version: 10, description: "010 (natural-key уникальность knowledge_nodes)", run: migrateV010KnowledgeNodeNaturalKey },
       { version: 11, description: "011 (FTS5-индекс памяти)", run: migrateV011KnowledgeFts },
       { version: 12, description: "012 (tool_warning/turn_completed)", run: migrateV012EventTaxonomy },
+      { version: 13, description: "013 (change passports и file claims)", run: migrateV013ChangePassports },
     ];
 
     log.debug(`Текущая версия схемы: ${this.readSchemaVersion()}`);
@@ -965,6 +972,34 @@ export class StorageEngine {
     }
   }
 
+  private passportRow(row: Record<string, any>): ChangePassport {
+    return {
+      id: row.id, projectRoot: row.project_root, sessionId: row.session_id,
+      taskId: row.task_id, contractId: row.contract_id, intent: row.intent,
+      status: row.status, riskScore: row.risk_score ?? 0,
+      riskLevel: row.risk_level ?? "unknown",
+      files: this.parseJson<PassportFile[]>(row.files, []),
+      evidenceIds: this.parseJson<string[]>(row.evidence_ids, []),
+      checks: this.parseJson<PassportCheck[]>(row.checks, []),
+      findings: this.parseJson<PassportFinding[]>(row.findings, []),
+      budgetTokens: row.budget_tokens, tokensUsed: row.tokens_used ?? 0,
+      allowDestructive: row.allow_destructive === 1 || row.allow_destructive === true,
+      agent: row.agent, model: row.model, baseRef: row.base_ref,
+      rollbackPlan: row.rollback_plan, reviewMd: row.review_md,
+      hash: row.hash, prevHash: row.prev_hash,
+      createdAt: row.created_at, updatedAt: row.updated_at, sealedAt: row.sealed_at,
+    }
+  }
+
+  private fileClaimRow(row: Record<string, any>): FileClaim {
+    return {
+      id: row.id, projectRoot: row.project_root, filePath: row.file_path,
+      sessionId: row.session_id, agent: row.agent, status: row.status,
+      note: row.note, createdAt: row.created_at, expiresAt: row.expires_at,
+      releasedAt: row.released_at,
+    }
+  }
+
   createTask(input: Omit<AgentTask, "id" | "createdAt" | "updatedAt" | "completedAt"> & { id?: string }): AgentTask {
     const now = Date.now(), id = input.id || crypto.randomUUID()
     this.getDb().prepare(`INSERT INTO agent_tasks
@@ -1069,7 +1104,7 @@ export class StorageEngine {
   evaluateTaskDone(taskId: string): {
     ready: boolean
     blockers: string[]
-    checks: Record<string, boolean | number>
+    checks: Record<string, boolean | number | string>
   } {
     const task = this.getTask(taskId)
     if (!task) return { ready: false, blockers: ["task_not_found"], checks: {} }
@@ -1081,6 +1116,7 @@ export class StorageEngine {
     const openFailures = this.listOpenFailuresForTask(task.projectRoot, taskId).length
     const contracts = this.listChangeContracts(task.projectRoot, taskId)
     const contradictions = this.countOpenContradictionsForTask(task.projectRoot, taskId)
+    const passport = this.getLatestPassport(task.projectRoot, undefined, taskId)
     const pendingSteps = steps.filter((step) => !["completed", "skipped"].includes(step.status)).length
     const badContracts = contracts.filter((item) => ["active", "violated"].includes(item.status)).length
     const blockers: string[] = []
@@ -1090,6 +1126,7 @@ export class StorageEngine {
     if (openFailures > 0) blockers.push(`open_failures:${openFailures}`)
     if (badContracts > 0) blockers.push(`unclosed_contracts:${badContracts}`)
     if (contradictions > 0) blockers.push(`open_contradictions:${contradictions}`)
+    if (passport && passport.status !== "sealed") blockers.push(`passport_${passport.status}`)
     return {
       ready: blockers.length === 0,
       blockers,
@@ -1100,6 +1137,7 @@ export class StorageEngine {
         openFailures,
         unclosedContracts: badContracts,
         openContradictions: contradictions,
+        passportStatus: passport?.status ?? "none",
       },
     }
   }
@@ -1362,6 +1400,213 @@ export class StorageEngine {
   updateHandoff(id: string, status: "open" | "claimed" | "completed"): AgentHandoff | undefined {
     this.getDb().prepare(`UPDATE agent_handoffs SET status = ?1, completed_at = CASE WHEN ?1 = 'completed' THEN ?2 ELSE completed_at END WHERE id = ?3`).run(status, Date.now(), id)
     return this.getHandoff(id)
+  }
+
+  // =========================================================================
+  // Change Passports и File Claims
+  // =========================================================================
+
+  createPassport(input: Omit<ChangePassport, "id" | "createdAt" | "updatedAt" | "sealedAt" | "hash" | "prevHash"> & { id?: string }): ChangePassport {
+    const now = Date.now(), id = input.id || crypto.randomUUID()
+    // A passport created directly in a terminal state is sealed at creation;
+    // updatePassport covers later draft -> sealed/blocked transitions.
+    const sealedAt = input.status === "sealed" || input.status === "blocked" ? now : null
+    this.getDb().prepare(`INSERT INTO change_passports
+      (id, project_root, session_id, task_id, contract_id, intent, status, risk_score, risk_level,
+       files, evidence_ids, checks, findings, budget_tokens, tokens_used, allow_destructive,
+       agent, model, base_ref, rollback_plan, review_md, hash, prev_hash, created_at, updated_at, sealed_at)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?24,?25)`).run(
+      id, input.projectRoot, input.sessionId ?? null, input.taskId ?? null,
+      input.contractId ?? null, truncateText(input.intent, 32000) ?? "", input.status,
+      input.riskScore ?? 0, input.riskLevel ?? "unknown",
+      this.json(input.files ?? []), this.json(input.evidenceIds ?? []),
+      this.json(input.checks ?? []), this.json(input.findings ?? []),
+      input.budgetTokens ?? null, input.tokensUsed ?? 0, input.allowDestructive ? 1 : 0,
+      input.agent ?? null, input.model ?? null, input.baseRef ?? null,
+      truncateText(input.rollbackPlan, 32000), truncateText(input.reviewMd, 16000),
+      null, null, now, sealedAt,
+    )
+    return this.getPassport(id)!
+  }
+
+  getPassport(id: string): ChangePassport | undefined {
+    const row = this.getDb().prepare(`SELECT * FROM change_passports WHERE id = ?1`).get(id) as Record<string, any> | undefined
+    return row ? this.passportRow(row) : undefined
+  }
+
+  /** Последний паспорт проекта; sessionId/taskId фильтруют по AND, если заданы. */
+  getLatestPassport(projectRoot: string, sessionId?: string, taskId?: string): ChangePassport | undefined {
+    const conditions = ["project_root = ?1"]
+    const values: (string | number)[] = [projectRoot]
+    if (sessionId) { conditions.push(`session_id = ?${values.length + 1}`); values.push(sessionId) }
+    if (taskId) { conditions.push(`task_id = ?${values.length + 1}`); values.push(taskId) }
+    const row = this.getDb().prepare(
+      `SELECT * FROM change_passports WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT 1`,
+    ).get(...values) as Record<string, any> | undefined
+    return row ? this.passportRow(row) : undefined
+  }
+
+  listPassports(projectRoot: string, status?: string, limit = 20): ChangePassport[] {
+    const rows = status
+      ? this.getDb().prepare(`SELECT * FROM change_passports WHERE project_root = ?1 AND status = ?2 ORDER BY created_at DESC LIMIT ?3`).all(projectRoot, status, limit)
+      : this.getDb().prepare(`SELECT * FROM change_passports WHERE project_root = ?1 ORDER BY created_at DESC LIMIT ?2`).all(projectRoot, limit)
+    return (rows as Record<string, any>[]).map((row) => this.passportRow(row))
+  }
+
+  updatePassport(id: string, patch: Partial<Pick<ChangePassport,
+    "status" | "riskScore" | "riskLevel" | "files" | "evidenceIds" | "checks" | "findings" |
+    "budgetTokens" | "tokensUsed" | "allowDestructive" | "contractId" | "intent" | "reviewMd" |
+    "hash" | "prevHash" | "sealedAt" | "rollbackPlan" | "agent" | "model" | "baseRef"
+  >>): ChangePassport | undefined {
+    const columnMap: Record<string, string> = {
+      status: "status", riskScore: "risk_score", riskLevel: "risk_level",
+      files: "files", evidenceIds: "evidence_ids", checks: "checks", findings: "findings",
+      budgetTokens: "budget_tokens", tokensUsed: "tokens_used",
+      allowDestructive: "allow_destructive", contractId: "contract_id", intent: "intent",
+      reviewMd: "review_md", hash: "hash", prevHash: "prev_hash", sealedAt: "sealed_at",
+      rollbackPlan: "rollback_plan", agent: "agent", model: "model", baseRef: "base_ref",
+    }
+    const jsonFields = new Set(["files", "evidenceIds", "checks", "findings"])
+    const fields: string[] = [], values: unknown[] = []
+    for (const [key, value] of Object.entries(patch)) {
+      // Explicit undefined keys arrive from partial tool patches; skip them.
+      if (value === undefined) continue
+      const column = columnMap[key]
+      if (!column) continue
+      fields.push(`${column} = ?`)
+      if (jsonFields.has(key)) values.push(this.json(value))
+      else if (key === "allowDestructive") values.push(value ? 1 : 0)
+      else if (key === "intent") values.push(truncateText(value as string, 32000) ?? "")
+      else if (key === "reviewMd") values.push(truncateText(value as string | null, 16000))
+      else values.push(value)
+    }
+    // Sealing or blocking a passport without an explicit timestamp stamps now;
+    // an explicit sealedAt from the caller always wins.
+    if ((patch.status === "sealed" || patch.status === "blocked") && patch.sealedAt === undefined) {
+      fields.push("sealed_at = ?"); values.push(Date.now())
+    }
+    if (!fields.length) return this.getPassport(id)
+    fields.push("updated_at = ?"); values.push(Date.now(), id)
+    this.getDb().prepare(`UPDATE change_passports SET ${fields.join(", ")} WHERE id = ?`).run(...(values as any[]))
+    return this.getPassport(id)
+  }
+
+  /** Хеш последнего паспорта проекта для продолжения hash chain. */
+  getLastPassportHash(projectRoot: string): string | null {
+    const row = this.getDb().prepare(
+      `SELECT hash FROM change_passports
+       WHERE project_root = ?1 AND hash IS NOT NULL
+       ORDER BY created_at DESC LIMIT 1`,
+    ).get(projectRoot) as { hash: string | null } | undefined
+    return row?.hash ?? null
+  }
+
+  claimFile(input: {
+    projectRoot: string
+    filePath: string
+    sessionId: string
+    agent?: string | null
+    note?: string | null
+    ttlMs?: number
+  }): { claim: FileClaim | null; conflict: FileClaim | null } {
+    const db = this.getDb()
+    const now = Date.now()
+    const ttlMs = input.ttlMs ?? 30 * 60 * 1000
+
+    // Expire stale claims first so a dead session never blocks the file.
+    db.prepare(
+      `UPDATE file_claims SET status = 'expired'
+       WHERE project_root = ?1 AND file_path = ?2 AND status = 'active' AND expires_at <= ?3`,
+    ).run(input.projectRoot, input.filePath, now)
+
+    const active = db.prepare(
+      `SELECT * FROM file_claims WHERE project_root = ?1 AND file_path = ?2 AND status = 'active' LIMIT 1`,
+    ).get(input.projectRoot, input.filePath) as Record<string, any> | undefined
+    if (active) {
+      const existing = this.fileClaimRow(active)
+      // Re-claiming a file the same session already owns is idempotent.
+      if (existing.sessionId === input.sessionId) return { claim: existing, conflict: null }
+      return { claim: null, conflict: existing }
+    }
+
+    const id = crypto.randomUUID()
+    try {
+      db.prepare(`INSERT INTO file_claims
+        (id, project_root, file_path, session_id, agent, status, note, created_at, expires_at, released_at)
+        VALUES (?1,?2,?3,?4,?5,'active',?6,?7,?8,NULL)`).run(
+        id, input.projectRoot, input.filePath, input.sessionId, input.agent ?? null,
+        truncateText(input.note, 2000), now, now + Math.max(1, ttlMs),
+      )
+    } catch (err) {
+      // The partial unique index can fire when another process claimed the
+      // file between our SELECT and INSERT; report it as a conflict.
+      const raced = db.prepare(
+        `SELECT * FROM file_claims WHERE project_root = ?1 AND file_path = ?2 AND status = 'active' LIMIT 1`,
+      ).get(input.projectRoot, input.filePath) as Record<string, any> | undefined
+      const conflict = raced ? this.fileClaimRow(raced) : null
+      if (conflict && conflict.sessionId === input.sessionId) return { claim: conflict, conflict: null }
+      log.debug(`claimFile conflict for ${input.filePath}: ${String(err)}`)
+      return { claim: null, conflict }
+    }
+
+    const row = db.prepare(`SELECT * FROM file_claims WHERE id = ?1`).get(id) as Record<string, any> | undefined
+    return { claim: row ? this.fileClaimRow(row) : null, conflict: null }
+  }
+
+  releaseFileClaim(projectRoot: string, filePath: string, sessionId: string): boolean {
+    const result = this.getDb().prepare(
+      `UPDATE file_claims SET status = 'released', released_at = ?1
+       WHERE project_root = ?2 AND file_path = ?3 AND session_id = ?4 AND status = 'active'`,
+    ).run(Date.now(), projectRoot, filePath, sessionId)
+    return Number(result.changes) > 0
+  }
+
+  listFileClaims(projectRoot: string, activeOnly = true): FileClaim[] {
+    const db = this.getDb()
+    if (activeOnly) {
+      db.prepare(
+        `UPDATE file_claims SET status = 'expired'
+         WHERE project_root = ?1 AND status = 'active' AND expires_at <= ?2`,
+      ).run(projectRoot, Date.now())
+    }
+    const rows = activeOnly
+      ? db.prepare(`SELECT * FROM file_claims WHERE project_root = ?1 AND status = 'active' ORDER BY created_at DESC`).all(projectRoot)
+      : db.prepare(`SELECT * FROM file_claims WHERE project_root = ?1 ORDER BY created_at DESC`).all(projectRoot)
+    return (rows as Record<string, any>[]).map((row) => this.fileClaimRow(row))
+  }
+
+  getFileClaim(projectRoot: string, filePath: string, now = Date.now()): FileClaim | undefined {
+    const row = this.getDb().prepare(
+      `SELECT * FROM file_claims
+       WHERE project_root = ?1 AND file_path = ?2 AND status = 'active' AND expires_at > ?3
+       ORDER BY created_at DESC LIMIT 1`,
+    ).get(projectRoot, filePath, now) as Record<string, any> | undefined
+    return row ? this.fileClaimRow(row) : undefined
+  }
+
+  /** Уникальные файлы сессии (file_edits), сначала недавно изменённые. */
+  getSessionChangedFiles(sessionId: string, limit = 200): string[] {
+    const rows = this.getDb().prepare(
+      `SELECT file_path, MAX(timestamp) AS last_timestamp FROM file_edits
+       WHERE session_id = ?1
+       GROUP BY file_path
+       ORDER BY last_timestamp DESC
+       LIMIT ?2`,
+    ).all(sessionId, limit) as { file_path: string; last_timestamp: number }[]
+    return rows.map((row) => row.file_path)
+  }
+
+  /** Превью вызовов инструментов сессии для паспорта изменения. */
+  getToolExecutionPreviews(sessionId: string, limit = 500): Array<{ toolName: string; argsPreview: string | null; status: string; timestamp: number }> {
+    const rows = this.getDb().prepare(
+      `SELECT tool_name, args_preview, status, timestamp FROM tool_executions
+       WHERE session_id = ?1
+       ORDER BY timestamp DESC LIMIT ?2`,
+    ).all(sessionId, limit) as { tool_name: string; args_preview: string | null; status: string; timestamp: number }[]
+    return rows.map((row) => ({
+      toolName: row.tool_name, argsPreview: row.args_preview,
+      status: row.status, timestamp: row.timestamp,
+    }))
   }
 
   // =========================================================================

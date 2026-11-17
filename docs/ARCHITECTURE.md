@@ -21,10 +21,12 @@ Code Shadow — локальный плагин OpenCode: постоянная �
 
 | Модуль | Ответственность |
 |---|---|
-| `src/index.ts` | точка входа: конфиг, StorageEngine, observer, TUI-хуки, 16 инструментов, интервалы, `dispose`, CRUSH.md/AGENTS.md |
+| `src/index.ts` | точка входа: конфиг, StorageEngine, observer, TUI-хуки, 17 инструментов, интервалы, `dispose`, CRUSH.md/AGENTS.md |
 | `src/storage.ts` | SQLite/WAL, миграции, CRUD, аналитические агрегаты, batch-очередь, retention |
 | `src/observer.ts` | приём событий/хуков, телеметрия, auto-memory, auto-task, auto-evidence, guardrails |
 | `src/tools/agent.ts` | Task Graph, Evidence, Failure Memory, Change Contract, Context Router, Counterfactual, Handoff, Insight, Contradiction, Provenance |
+| `src/passport.ts` | Proof-Carrying Change: almost-right scanner, destructive-command classifier, risk, hash-chain, review packet |
+| `src/tools/passport.ts` | `code_shadow_passport` и file claims |
 | `src/tools/analyze.ts` | `code_shadow_analyze` (9 режимов) |
 | `src/tools/memory.ts` | `code_shadow_memory_write/search/note` |
 | `src/tools/context.ts` | `code_shadow_context_inject` |
@@ -69,7 +71,7 @@ OpenCode event/hook
 5. `ensureCrushMd` и `ensureTuiPlugin`: один блок инструкций пишется в
    `CRUSH.md` (OpenCode 1) и `AGENTS.md` (OpenCode 2) с сохранением
    пользовательского текста вне маркеров; установка/мерж `tui.json`.
-6. Регистрация 16 инструментов и observer/TUI-хуков.
+6. Регистрация 17 инструментов и observer/TUI-хуков.
 7. `dispose` (или exit/SIGINT/SIGTERM): снять интервалы и process-listeners,
    flush, закрыть БД.
 
@@ -123,9 +125,23 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
 - **Verification evidence**: только shell/явная команда, без `echo/grep`-обманок
   и `|| true`; failure-маркеры в успешном выводе переводят evidence в `failed`.
 
+## 6.1. Proof-Carrying Change
+
+`code_shadow_passport` собирает одно изменение агента в проверяемый пакет:
+intent, файлы + SHA-256, almost-right findings, Change Contract, verified
+evidence, открытые failures/contradictions, разрушительные shell-команды,
+file claims других сессий, бюджет токенов, risk-score, `prev_hash`/`hash` и
+review Markdown.
+
+`seal` блокирует паспорт при отсутствии verified evidence, нарушениях
+контракта, активных file-claim конфликтах или critical/error findings;
+`verify` пересчитывает hash и сверяет хеши файлов с диском. Definition of Done
+требует `status=sealed`, если у задачи есть паспорт. `file_claims` дают
+кооперативную блокировку файлов между несколькими агентами.
+
 ## 7. Хранение
 
-- 19 таблиц + FTS5-таблица `knowledge_nodes_fts`; миграции 001–012, версия в
+- 21 таблица + FTS5-таблица `knowledge_nodes_fts`; миграции 001–013, версия в
   `schema_version`.
 - Batch-очередь: `batchSize` (default 10), flush каждые 5 с; при ошибке batch
   выполняется построчная запись, «отравленные» строки логируются, очередь не
@@ -185,7 +201,7 @@ Legacy-хуки `file.edited` и `lsp.diagnostic` сохранены для ст
 `src/v2.ts` — единственная точка входа V2 (`exports["."]`). Он поднимает то же
 ядро, что и `src/index.ts`, и переводит V2 API в V1-контракты.
 
-- **Tools**: `ctx.tool.transform` регистрирует 16 инструментов с
+- **Tools**: `ctx.tool.transform` регистрирует 17 инструментов с
   `codemode: false`; `ctx.tool.hook("execute.before"/"execute.after")` вызывает
   V1-guardrails, `ctx.session.hook("prompt")` — auto-task, `ctx.session.hook("compaction")`
   — briefing, `ctx.permission.hook("evaluate")` — hard deny Change Contract.

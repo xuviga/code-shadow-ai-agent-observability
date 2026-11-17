@@ -29,6 +29,7 @@ declare success while the work is still incomplete.
 - **Change Contracts** — active path boundaries can warn or block unsafe edits.
 - **Failure Memory** — root causes and do-not-repeat guidance are reusable by future agents.
 - **Definition of Done** — completion is guarded by steps, evidence, failures, contracts, and contradictions.
+- **Proof-Carrying Change** — every change can carry a sealed passport: intent, almost-right findings, evidence, contracts, destructive-command checks, file claims, token budget, hash-chain and a review packet.
 - **TUI dashboard** — live project health and agent activity without sending code to a cloud service.
 
 ### Quick start
@@ -563,7 +564,8 @@ task:create → context_router → change_contract:create
 Инструменты этого слоя: `code_shadow_task`, `code_shadow_evidence`,
 `code_shadow_failure_memory`, `code_shadow_change_contract`,
 `code_shadow_counterfactual`, `code_shadow_context_router`, `code_shadow_contradiction`,
-`code_shadow_provenance`, `code_shadow_handoff`, `code_shadow_agent_insight`.
+`code_shadow_provenance`, `code_shadow_handoff`, `code_shadow_agent_insight`,
+`code_shadow_passport`.
 
 Предоставляет набор инструментов, которые AI-агент OpenCode может вызывать
 для получения аналитики прямо во время сессии.
@@ -706,7 +708,7 @@ git clone https://github.com/xuviga/code-shadow-ai-agent-observability.git ~/.co
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │               📊 Storage Engine (SQLite/WAL)          │   │
 │  │                                                      │   │
-│  │  • 19 таблиц: события, память, решения, tasks/evidence  │   │
+│  │  • 21 таблица: события, память, tasks, passports, claims │   │
 │  │    tool_executions, decisions, knowledge_nodes,      │   │
 │  │    knowledge_edges, developer_events,                │   │
 │  │    analytics_cache, schema_version                   │   │
@@ -715,7 +717,7 @@ git clone https://github.com/xuviga/code-shadow-ai-agent-observability.git ~/.co
 │  └──────────────────────┬───────────────────────────────┘   │
 │                         ▼                                    │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │           🧰 AI Tools (16 тулзов)                     │   │
+│  │           🧰 AI Tools (17 тулзов)                     │   │
 │  │                                                      │   │
 │  │  • code_shadow_analyze (9 режимов)                  │   │
 │  │  • code_shadow_memory_write/search/note              │   │
@@ -914,7 +916,7 @@ Observer: session.compacted
 | **Внешнее облако** | Нарушает принцип zero-config и локальной конфиденциальности |
 | **Redis** | SQLite WAL-режим решает проблему конкурентного доступа без отдельного сервиса |
 | **better-sqlite3** | Требует Node.js и нативные модули; `bun:sqlite` встроен в Bun и не требует компиляции |
-| **ORM (Prisma/Drizzle)** | Избыточно для 19 таблиц; сырой SQL через `bun:sqlite` проще и быстрее |
+| **ORM (Prisma/Drizzle)** | Избыточно для 21 таблицы; сырой SQL через `bun:sqlite` проще и быстрее |
 
 ---
 
@@ -949,7 +951,7 @@ Observer: session.compacted
 
 - [x] Базовая структура плагина (`index.ts`, `package.json`, `tsconfig.json`)
 - [x] Подключение к OpenCode Plugin SDK (`@opencode-ai/plugin`)
-- [x] Схема БД: 19 таблиц после миграции v11 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`) + FTS5-таблица `knowledge_nodes_fts`
+- [x] Схема БД: 21 таблица после миграции v13 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`, `change_passports`, `file_claims`) + FTS5-таблица `knowledge_nodes_fts`
 - [x] Подписка на событие `file.edited` (прямой именованный хук + авто-детект фактов)
 - [x] Подписка на событие `session.created` / `session.idle` / `session.error` / `session.compacted`
 - [x] Подписка на событие `tool.execute.before` / `tool.execute.after`

@@ -24,6 +24,7 @@ export const DEFAULT_CONFIG: ShadowConfig = {
   maxDiffPreviewChars: 500,
   maxArgsPreviewChars: 200,
   disabledEventTypes: [],
+  destructiveActionPolicy: "block",
   secretPatterns: [
     // .env файлы
     "(?:^|\\W)DB_(?:PASSWORD|USER|NAME|HOST|PORT|URL)\\s*=\\s*\\S+",
@@ -152,6 +153,8 @@ export function loadConfig(
     disabledEventTypes:
       userConfig.disabledEventTypes ?? DEFAULT_CONFIG.disabledEventTypes,
     secretPatterns: userConfig.secretPatterns ?? DEFAULT_CONFIG.secretPatterns,
+    destructiveActionPolicy:
+      userConfig.destructiveActionPolicy ?? DEFAULT_CONFIG.destructiveActionPolicy,
   };
 
   return merged;
@@ -188,6 +191,8 @@ function normalizeUserConfig(
     result.disabledEventTypes = raw.disabledEventTypes as string[];
   if (Array.isArray(raw.secretPatterns))
     result.secretPatterns = raw.secretPatterns as string[];
+  if (raw.destructiveActionPolicy === "block" || raw.destructiveActionPolicy === "warn")
+    result.destructiveActionPolicy = raw.destructiveActionPolicy;
 
   return result;
 }

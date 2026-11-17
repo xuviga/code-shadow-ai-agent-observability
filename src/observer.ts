@@ -12,6 +12,7 @@ import { NodeType } from "./types"
 import { sanitizeContent } from "./config"
 import { pathMatches } from "./path-match"
 import { normalizeProjectPath } from "./project-path"
+import { classifyDestructiveCommand } from "./passport"
 import type { createLogger } from "./logger"
 import * as path from "node:path"
 
@@ -63,6 +64,8 @@ interface StorageEngineLike {
   listTasks(projectRoot: string, status?: string, limit?: number): any[]
   getActiveTaskForSession(sessionId: string): any | undefined
   getOpenTaskForSession(sessionId: string): any | undefined
+  getLatestPassport(projectRoot: string, sessionId?: string, taskId?: string): any | undefined
+  getFileClaim(projectRoot: string, filePath: string, now?: number): any | undefined
   recordEvidence(input: any): any
 }
 
@@ -116,6 +119,16 @@ class SuccessfulEditLoopGuardError extends Error {
   constructor(filePath: string, count: number) {
     super(`[Code Shadow] остановлена повторная запись ${filePath}: ${count} успешных write/edit за короткий интервал. Проверь root cause, текущий diff и следующий шаг задачи.`)
     this.name = "SuccessfulEditLoopGuardError"
+  }
+}
+
+class DestructiveCommandGuardError extends Error {
+  constructor(command: string, reasons: string[]) {
+    super(
+      `[Code Shadow] разрушительная команда заблокирована: ${command.slice(0, 220)}. ` +
+        `Причины: ${reasons.join(", ")}. Создай Change Passport с allow_destructive=true после осознанного подтверждения.`,
+    )
+    this.name = "DestructiveCommandGuardError"
   }
 }
 
@@ -2177,6 +2190,53 @@ export function createObserver(
       const timingKey = `${sessionId}:${callId}`
       toolStartTimes.set(timingKey, Date.now())
 
+      // Proof-Carrying Change firewall: destructive shell commands are blocked
+      // unless a passport for this session/task explicitly allows them.
+      const command = extractCommand(output.args || {})
+      const isShellTool = /^(bash|shell|exec|command|run|terminal|powershell|pwsh|cmd)$/i.test(toolName)
+      const hasExplicitCommand =
+        typeof output.args?.command === "string" || typeof output.args?.cmd === "string"
+      if (command && (isShellTool || hasExplicitCommand)) {
+        const destructive = classifyDestructiveCommand(command).filter(
+          (item) => item.severity === "critical" || item.severity === "error",
+        )
+        if (destructive.length > 0) {
+          const session = storage.getSession(sessionId)
+          const activeTask = storage.getActiveTaskForSession(sessionId)
+          const passport = session
+            ? storage.getLatestPassport(session.projectRoot, sessionId, activeTask?.id)
+            : undefined
+          const allowed = Boolean(
+            passport?.allowDestructive &&
+              passport.sessionId === sessionId &&
+              passport.status === "draft",
+          )
+          const policy = config.destructiveActionPolicy ?? "block"
+          storage.enqueue("developer_events", {
+            event_type: allowed || policy === "warn" ? "tool_warning" : "tool_rejected",
+            session_id: sessionId,
+            file_path: null,
+            metadata: JSON.stringify({
+              reason: "destructive_command",
+              blocking: !allowed && policy === "block",
+              severity: !allowed && policy === "block" ? "critical" : "warning",
+              tool: toolName,
+              command: command.slice(0, 220),
+              findings: destructive.map((item) => item.kind),
+              passport_id: passport?.id ?? null,
+            }),
+            timestamp: Date.now(),
+          })
+          if (!allowed && policy === "block") {
+            throw new DestructiveCommandGuardError(
+              command,
+              destructive.map((item) => item.kind),
+            )
+          }
+          log.warn(`Destructive command ${allowed ? "allowed by passport" : "warned"}: ${command.slice(0, 160)}`)
+        }
+      }
+
       if (isMutatingFileTool(toolName)) {
         // Phase 4: proactive risk check goes here
         log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId}, callId: ${callId})`)
@@ -2184,6 +2244,27 @@ export function createObserver(
         for (const target of targets) assertEditLoopAllowed(sessionId, toolName, target)
         const session = storage.getSession(sessionId)
         if (targets.length > 0 && session) {
+          for (const target of targets) {
+            const normalizedTarget = normalizeProjectPath(session.projectRoot, target)
+            const claim = storage.getFileClaim(session.projectRoot, normalizedTarget)
+            if (claim && claim.sessionId !== sessionId) {
+              storage.enqueue("developer_events", {
+                event_type: "tool_warning",
+                session_id: sessionId,
+                file_path: normalizedTarget,
+                metadata: JSON.stringify({
+                  reason: "file_claim_conflict",
+                  blocking: false,
+                  severity: "warning",
+                  tool: toolName,
+                  owner_session: claim.sessionId,
+                  claim_id: claim.id,
+                }),
+                timestamp: Date.now(),
+              })
+              log.warn(`File claim conflict: ${normalizedTarget} held by ${claim.sessionId}`)
+            }
+          }
           try {
             const contracts = storage.getDb().prepare(`SELECT id, allowed_paths, forbidden_paths FROM change_contracts WHERE project_root = ?1 AND status = 'active'`).all(session.projectRoot) as Array<{ id: string; allowed_paths: string; forbidden_paths: string }>
             for (const contract of contracts) {
@@ -2211,7 +2292,9 @@ export function createObserver(
         log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId})`)
       }
     } catch (err) {
-      if (err instanceof SuccessfulEditLoopGuardError) throw err
+      if (err instanceof SuccessfulEditLoopGuardError || err instanceof DestructiveCommandGuardError) {
+        throw err
+      }
       log.error("Ошибка в toolExecuteBefore", err)
     }
   }

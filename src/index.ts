@@ -17,6 +17,7 @@ import { createAnalyzeTool } from "./tools/analyze.js"
 import { createContextTool } from "./tools/context.js"
 import { createDecideTool } from "./tools/decide.js"
 import { createAgentTools } from "./tools/agent.js"
+import { createPassportTool } from "./tools/passport.js"
 import { createLogger } from "./logger.js"
 
 // ---------------------------------------------------------------------------
@@ -240,7 +241,8 @@ ${lastSession ? `- **Последняя сессия**: ${lastSession.agent_type
 5. **Перед рискованной правкой** → code_shadow_counterfactual
 6. **При баге или ошибке** → code_shadow_analyze query="code_errors" + code_shadow_failure_memory
 7. **После проверки** → evidence создаётся автоматически для test/typecheck/build/lint/check команд
-8. **Перед завершением** → code_shadow_task action="done_check", затем action="complete"
+8. **Перед завершением** → code_shadow_passport action="seal", затем code_shadow_task action="done_check", затем action="complete"
+8a. **Если паспорт blocked** → устрани findings/контракты/claims и повтори seal; не объявляй успех
 9. **При конфликте источников** → code_shadow_contradiction
 10. **Важный факт о проекте** → code_shadow_memory_write
 11. **Каждые 5-10 правок** → code_shadow_analyze query="hotspots"
@@ -268,6 +270,7 @@ ${lastSession ? `- **Последняя сессия**: ${lastSession.agent_type
 | code_shadow_counterfactual | Какие файлы/риски/проверки затронет возможная правка |
 | code_shadow_contradiction | Конфликтующие утверждения и их разрешение |
 | code_shadow_provenance | Доверие к файлам/выводу инструментов и injection flags |
+| code_shadow_passport | Proof-Carrying Change: intent, findings, evidence, contracts, claims, hash-chain, review packet |
 | code_shadow_handoff | Переносимый снимок работы между агентами/сессиями |
 | code_shadow_agent_insight | Поведение агента, качество evidence и риск работы |
 | code_shadow_memory_write | Сохранить важный факт (пути, конфиги, конвенции) |
@@ -420,6 +423,7 @@ export const CodeShadow = async (
     ...createContextTool(storage, config, log),
     ...createDecideTool(storage, config, log),
     ...createAgentTools(storage, config, log),
+    ...createPassportTool(storage, config, log),
   }
 
   log.info(`Загружено тулзов: ${Object.keys(allTools).length}`)

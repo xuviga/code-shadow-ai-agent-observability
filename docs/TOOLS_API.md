@@ -1,6 +1,6 @@
 # API инструментов Code Shadow
 
-> Актуально на v0.5.3 (12.11.2026, follow-up P0–P2). 16 инструментов;
+> Актуально на v0.5.3 (17.11.2026). 17 инструментов;
 > исполняемый источник — `src/tools/*.ts`. Все инструменты возвращают
 > `{ output: string }`; в норме `output` — JSON, но `analyze`,
 > `memory_write` и `memory_note` при внутренней ошибке могут вернуть plain
@@ -88,6 +88,26 @@ title/description; `file_history` — по путям; `analytics` читает 
 Пишет `decisions`, узел `decision`, файловые узлы и `references`-рёбра.
 `alternatives`/`related_files` санитизируются, массивы ограничиваются по длине.
 
+## Proof-Carrying Change (1)
+
+### `code_shadow_passport`
+Actions: `open | add | seal | get | list | review | verify | export | claim | release | claims`.
+
+Паспорт изменения — единый проверяемый пакет: intent, файлы и их хеши,
+almost-right findings (пустые catch, отключённые тесты, `|| true`, `as any`,
+SQL DROP/DELETE без WHERE), Change Contract, verified evidence, открытые
+failures/contradictions, разрушительные shell-команды, file claims, бюджет
+токенов, risk-score, hash-chain (`prev_hash`) и готовый review Markdown.
+
+- `open` требует `intent`; `files` и `budget_tokens` опциональны.
+- `seal` собирает доказательства, блокирует при отсутствии verified evidence,
+  нарушениях контракта, конфликтах claims или critical/error findings.
+- `verify` пересчитывает hash и сверяет хеши файлов с диском; изменение файла
+  после seal делает паспорт `stale`.
+- `claim/release/claims` — координация нескольких агентов по файлам.
+- `export` пишет `.md`/`.json` в `~/.config/opencode/shadow/passports/`.
+- Если у задачи есть паспорт, Definition of Done требует `status=sealed`.
+
 ## Task Graph и governance (10)
 
 ### `code_shadow_task`
@@ -126,6 +146,7 @@ Actions: `create | list | get | check | close`.
 ```json
 { "phase": "verify", "task_id": "...", "query": "storage", "limit": 20, "project_root": "C:/project" }
 ```
+Также возвращает `passport` — последний Change Passport текущей задачи/сессии.
 Фазы: `explore` (+architecture), `build` (task state), `verify` (без памяти,
 limit 20), `handoff` (+последний open handoff). Возвращает задачи/шаги,
 evidence, открытые failures (по задаче или глобальные), активные контракты,

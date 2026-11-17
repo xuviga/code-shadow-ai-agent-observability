@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { StorageEngine } from "../src/storage"
 import { migrateV010KnowledgeNodeNaturalKey } from "../src/migrations/010_knowledge_node_natural_key"
-import { AgentType, EditType, ErrorType, EvidenceStatus, NodeType, SessionStatus, TaskStatus, TaskStepStatus } from "../src/types"
+import { AgentType, EditType, ErrorType, EvidenceStatus, NodeType, SessionStatus, TaskStatus, TaskStepStatus, ToolStatus } from "../src/types"
 
 const databases: Array<{ storage: StorageEngine; directory: string }> = []
 
@@ -51,14 +51,16 @@ describe("StorageEngine", () => {
     const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'todos'").get()
     const errorFileIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_errors_file'").get()
 
-    expect(version.version).toBe(12)
+    expect(version.version).toBe(13)
     expect(table).toBeTruthy()
     expect(errorFileIndex).toBeTruthy()
     const uniqueEdgeIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ke_unique'").get()
     expect(uniqueEdgeIndex).toBeTruthy()
-    for (const name of ["agent_tasks", "task_steps", "evidence_records", "failure_memory", "change_contracts", "contradiction_records", "provenance_events", "agent_handoffs"]) {
+    for (const name of ["agent_tasks", "task_steps", "evidence_records", "failure_memory", "change_contracts", "contradiction_records", "provenance_events", "agent_handoffs", "change_passports", "file_claims"]) {
       expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1").get(name)).toBeTruthy()
     }
+    const activeClaimIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_file_claims_active'").get()
+    expect(activeClaimIndex).toBeTruthy()
     const knColumns = db.prepare(`PRAGMA table_info("knowledge_nodes")`).all() as Array<{ name: string }>
     const decisionColumns = db.prepare(`PRAGMA table_info("decisions")`).all() as Array<{ name: string }>
     expect(knColumns.some((column) => column.name === "project_root")).toBe(true)
@@ -703,5 +705,157 @@ describe("StorageEngine", () => {
       duplicateRejected = true
     }
     expect(duplicateRejected).toBe(true)
+  })
+
+  test("creates, updates and chains change passports", () => {
+    const storage = createStorage()
+    const project = "C:/project"
+    const first = storage.createPassport({
+      projectRoot: project, sessionId: "ses_pass_a", taskId: "task-a", contractId: null,
+      intent: "Add change passports", status: "draft", riskScore: 0.2, riskLevel: "low",
+      files: [{ path: "src/passport.ts", editType: "update", linesAdded: 10, linesRemoved: 2, hash: "abc123" }],
+      evidenceIds: ["ev-1", "ev-2"],
+      checks: [{ id: "typecheck", label: "Typecheck", status: "pass", details: null }],
+      findings: [{ kind: "lint", severity: "warning", file: "src/passport.ts", line: 7, message: "unused import" }],
+      budgetTokens: 1000, tokensUsed: 50, allowDestructive: false,
+      agent: "build", model: "model-x", baseRef: "main",
+      rollbackPlan: "git revert", reviewMd: "# Review",
+    })
+
+    expect(first.status).toBe("draft")
+    expect(first.sealedAt).toBeNull()
+    expect(first.files).toEqual([{ path: "src/passport.ts", editType: "update", linesAdded: 10, linesRemoved: 2, hash: "abc123" }])
+    expect(first.evidenceIds).toEqual(["ev-1", "ev-2"])
+    expect(first.checks[0].status).toBe("pass")
+    expect(first.findings[0].line).toBe(7)
+    expect(first.allowDestructive).toBe(false)
+
+    // Make the first passport strictly older so created_at ordering is stable.
+    storage.getDb().prepare("UPDATE change_passports SET created_at = ?1 WHERE id = ?2").run(Date.now() - 5000, first.id)
+
+    const second = storage.createPassport({
+      projectRoot: project, sessionId: "ses_pass_b", taskId: "task-b", contractId: null,
+      intent: "Second change", status: "draft", riskScore: 0, riskLevel: "low",
+      files: [], evidenceIds: [], checks: [], findings: [],
+      budgetTokens: null, tokensUsed: 0, allowDestructive: false,
+      agent: null, model: null, baseRef: null, rollbackPlan: null, reviewMd: null,
+    })
+
+    const sealed = storage.updatePassport(first.id, {
+      status: "sealed", hash: "hash-pass-1", tokensUsed: 120, allowDestructive: true,
+      files: [{ path: "src/passport.ts", editType: "update", linesAdded: 10, linesRemoved: 2, hash: "def456" }],
+    })!
+    expect(sealed.status).toBe("sealed")
+    expect(sealed.sealedAt).toBeGreaterThan(0)
+    expect(sealed.tokensUsed).toBe(120)
+    expect(sealed.allowDestructive).toBe(true)
+    expect(sealed.files[0].hash).toBe("def456")
+    expect(storage.getLastPassportHash(project)).toBe("hash-pass-1")
+
+    expect(storage.getLatestPassport(project)?.id).toBe(second.id)
+    expect(storage.getLatestPassport(project, "ses_pass_a")?.id).toBe(first.id)
+    expect(storage.getLatestPassport(project, undefined, "task-a")?.id).toBe(first.id)
+    expect(storage.getLatestPassport(project, "ses_pass_a", "task-a")?.id).toBe(first.id)
+    expect(storage.getLatestPassport(project, "ses_pass_b", "task-a")).toBeUndefined()
+
+    expect(storage.listPassports(project).map((passport) => passport.id)).toEqual([second.id, first.id])
+    expect(storage.listPassports(project, "sealed").map((passport) => passport.id)).toEqual([first.id])
+    expect(storage.listPassports(project, undefined, 1).map((passport) => passport.id)).toEqual([second.id])
+
+    const chained = storage.updatePassport(second.id, {
+      status: "blocked", hash: "hash-pass-2", prevHash: "hash-pass-1",
+    })!
+    expect(chained.status).toBe("blocked")
+    expect(chained.prevHash).toBe("hash-pass-1")
+    expect(chained.sealedAt).toBeGreaterThan(0)
+    expect(storage.getLastPassportHash(project)).toBe("hash-pass-2")
+  })
+
+  test("coordinates file claims across sessions and expires stale claims", () => {
+    const storage = createStorage()
+    const project = "C:/project"
+
+    const first = storage.claimFile({
+      projectRoot: project, filePath: "src/shared.ts", sessionId: "ses_claim_a",
+      agent: "build", note: "refactor",
+    })
+    expect(first.claim).toBeTruthy()
+    expect(first.conflict).toBeNull()
+    expect(first.claim!.expiresAt).toBeGreaterThan(first.claim!.createdAt)
+
+    const same = storage.claimFile({ projectRoot: project, filePath: "src/shared.ts", sessionId: "ses_claim_a" })
+    expect(same.claim?.id).toBe(first.claim!.id)
+    expect(same.conflict).toBeNull()
+    expect(storage.listFileClaims(project)).toHaveLength(1)
+
+    const other = storage.claimFile({ projectRoot: project, filePath: "src/shared.ts", sessionId: "ses_claim_b" })
+    expect(other.claim).toBeNull()
+    expect(other.conflict?.sessionId).toBe("ses_claim_a")
+
+    // An expired claim stops blocking new work and is marked expired.
+    storage.getDb().prepare("UPDATE file_claims SET expires_at = ?1 WHERE id = ?2")
+      .run(Date.now() - 1000, first.claim!.id)
+    const afterExpiry = storage.claimFile({
+      projectRoot: project, filePath: "src/shared.ts", sessionId: "ses_claim_b", ttlMs: 60_000,
+    })
+    expect(afterExpiry.conflict).toBeNull()
+    expect(afterExpiry.claim?.sessionId).toBe("ses_claim_b")
+    expect(storage.getFileClaim(project, "src/shared.ts")?.sessionId).toBe("ses_claim_b")
+    expect(storage.releaseFileClaim(project, "src/shared.ts", "ses_claim_a")).toBe(false)
+    expect(storage.releaseFileClaim(project, "src/shared.ts", "ses_claim_b")).toBe(true)
+    expect(storage.getFileClaim(project, "src/shared.ts")).toBeUndefined()
+    expect(storage.listFileClaims(project)).toHaveLength(0)
+
+    // After release the file is claimable again; released/expired history stays.
+    const reclaimed = storage.claimFile({ projectRoot: project, filePath: "src/shared.ts", sessionId: "ses_claim_a" })
+    expect(reclaimed.claim?.sessionId).toBe("ses_claim_a")
+    expect(reclaimed.conflict).toBeNull()
+    const history = storage.listFileClaims(project, false)
+    expect(history).toHaveLength(3)
+    expect(history.filter((claim) => claim.status === "released")).toHaveLength(1)
+    expect(history.filter((claim) => claim.status === "expired")).toHaveLength(1)
+  })
+
+  test("collects session changed files and tool execution previews", () => {
+    const storage = createStorage()
+    const now = Date.now()
+    const edit = (sessionId: string, filePath: string, timestamp: number) => storage.insertFileEdit({
+      filePath, sessionId, agentType: AgentType.Build, editType: EditType.Update,
+      diffPreview: null, linesAdded: 2, linesRemoved: 1, timestamp,
+      projectRoot: "C:/project", wasReverted: false, fileLanguage: "ts", diffHash: null,
+    } as never)
+
+    edit("ses_files", "src/older.ts", now - 2000)
+    edit("ses_files", "src/newer.ts", now - 1000)
+    edit("ses_files", "src/newer.ts", now - 500)
+    edit("ses_other", "src/other.ts", now)
+
+    expect(storage.getSessionChangedFiles("ses_files")).toEqual(["src/newer.ts", "src/older.ts"])
+    expect(storage.getSessionChangedFiles("ses_files", 1)).toEqual(["src/newer.ts"])
+
+    storage.insertToolExecution({
+      sessionId: "ses_files", toolName: "read", targetFile: "src/newer.ts",
+      argsPreview: "{\"filePath\":\"src/newer.ts\"}", status: ToolStatus.Success,
+      durationMs: 4, timestamp: now - 100, resultSizeBytes: 20,
+    })
+    storage.insertToolExecution({
+      sessionId: "ses_files", toolName: "edit", targetFile: "src/newer.ts",
+      argsPreview: "{\"filePath\":\"src/newer.ts\"}", status: ToolStatus.Error,
+      durationMs: 8, timestamp: now, resultSizeBytes: 0,
+    })
+    storage.insertToolExecution({
+      sessionId: "ses_other", toolName: "bash", targetFile: null,
+      argsPreview: "echo", status: ToolStatus.Success,
+      durationMs: 1, timestamp: now, resultSizeBytes: 5,
+    })
+
+    const previews = storage.getToolExecutionPreviews("ses_files")
+    expect(previews).toHaveLength(2)
+    expect(previews[0]).toEqual({
+      toolName: "edit", argsPreview: "{\"filePath\":\"src/newer.ts\"}",
+      status: ToolStatus.Error, timestamp: now,
+    })
+    expect(previews[1].toolName).toBe("read")
+    expect(storage.getToolExecutionPreviews("ses_files", 1)).toHaveLength(1)
   })
 })

@@ -797,6 +797,44 @@ describe("Observer", () => {
     expect(storage.listTaskSteps(tasks[0].id)).toHaveLength(1)
   })
 
+  test("blocks critical destructive commands unless a passport allows them", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-session-destructive"
+    await observer.event({
+      event: { type: "session.created", properties: { info: { id: sessionId, directory: "C:/project", time: { created: Date.now() } } } },
+    })
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "bash", sessionID: sessionId, callID: "danger" },
+        { args: { command: "rm -rf ./src" } },
+      )
+    } catch (error) {
+      blocked = String(error).includes("разрушительная команда")
+    }
+    expect(blocked).toBe(true)
+
+    storage.createPassport({
+      projectRoot: "C:/project", sessionId, taskId: null, contractId: null,
+      intent: "Approved cleanup", status: "draft", riskScore: 0, riskLevel: "low",
+      files: [], evidenceIds: [], checks: [], findings: [], budgetTokens: null,
+      tokensUsed: 0, allowDestructive: true, agent: "build", model: null,
+      baseRef: null, rollbackPlan: null, reviewMd: null,
+    })
+
+    let allowed = true
+    try {
+      await observer["tool.execute.before"](
+        { tool: "bash", sessionID: sessionId, callID: "allowed" },
+        { args: { command: "rm -rf ./tmp-allowed" } },
+      )
+    } catch {
+      allowed = false
+    }
+    expect(allowed).toBe(true)
+  })
+
   test("idle writes turn_completed, not a legacy session_completed", async () => {
     const { storage, observer } = createObserverFixture()
     const sessionId = "observer-session-turn"

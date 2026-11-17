@@ -12,12 +12,13 @@
   developer events, todo-изменения, LSP-диагностику и автоматически найденные
   факты.
 - Storage работает на `bun:sqlite`, включает WAL, batch-запись и миграции до
-  версии 12. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
+  версии 13. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
   плагин на полусхеме. Миграция 010 закрепляет natural-key уникальность
   `knowledge_nodes` (file — по `path`, остальные — по `name`, в рамках проекта),
   миграция 011 добавляет FTS5-индекс и триггеры синхронизации памяти,
   миграция 012 разделяет `tool_rejected` (блокировка) и `tool_warning`
-  (совет) и вводит `turn_completed` для завершения хода.
+  (совет) и вводит `turn_completed` для завершения хода, миграция 013
+  добавляет `change_passports` и `file_claims` для Proof-Carrying Change.
 - Аналитика предоставляет 9 режимов: `hotspots`, `predict_change`,
   `file_history`, `team_pulse`, `my_stats`, `dependency_graph`,
   `knowledge_search`, `decisions_list`, `code_errors`.
@@ -27,7 +28,8 @@
   `code_shadow_decide`, а также `code_shadow_task`, `code_shadow_evidence`,
   `code_shadow_failure_memory`, `code_shadow_change_contract`,
   `code_shadow_counterfactual`, `code_shadow_context_router`, `code_shadow_contradiction`,
-  `code_shadow_provenance`, `code_shadow_handoff` и `code_shadow_agent_insight`.
+  `code_shadow_provenance`, `code_shadow_handoff`, `code_shadow_agent_insight`
+и `code_shadow_passport`.
 - Change Contract автоматически помечается нарушенным на событии `file.edited`.
 - Handoff сохраняет переносимый снимок задачи, шагов, evidence, открытых сбоев
   и активных контрактов в SQLite.
@@ -62,25 +64,31 @@
 - Базовый тестовый контур находится в `tests/` и покрывает миграции, batch-запись,
   session/LSP/todo-события, нормализацию входных данных и поиск памяти.
 - OpenCode 2 загружает `src/v2.ts` (`exports["."]`): адаптер регистрирует те же
-  16 инструментов и guardrail-хуки, подписывается на 14 V2-событий и переводит
+  17 инструментов и guardrail-хуки, подписывается на 14 V2-событий и переводит
   их в V1-контракты. `session.step.ended.files` даёт `file.edited`,
   `execution.succeeded/interrupted` завершают ход через `session.idle`.
   Ограничения V2 (нет todo/LSP, `tui.command.execute` — только частичная замена
   `command.executed`, приближение message-метрик)
   описаны в [V2_COMPATIBILITY.md](V2_COMPATIBILITY.md).
+- `code_shadow_passport` (Proof-Carrying Change) создаёт проверяемый паспорт
+  изменения: intent, файлы и хеши, almost-right findings, Change Contract,
+  verified evidence, destructive-команды, file claims, бюджет токенов,
+  hash-chain и review Markdown. `seal` блокирует при отсутствии evidence,
+  нарушениях контракта, claim-конфликтах или critical/error findings;
+  Definition of Done требует `sealed`, если паспорт создан.
 - Один блок автономных правил пишется в `~/.config/opencode/CRUSH.md`
   (OpenCode 1) и `~/.config/opencode/AGENTS.md` (OpenCode 2); пользовательский
   текст вне маркеров сохраняется, повторный refresh не дублирует блок.
 
 ## Фактическая схема SQLite
 
-В свежей базе после миграций присутствуют 19 таблиц:
+В свежей базе после миграций присутствуют 21 таблица:
 
 `schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`,
 `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`,
 `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`,
 `failure_memory`, `change_contracts`, `contradiction_records`,
-`provenance_events`, `agent_handoffs`.
+`provenance_events`, `agent_handoffs`, `change_passports`, `file_claims`.
 
 Таблица `developer_profile` в текущей реализации отсутствует: статистика
 разработчика вычисляется из событий и сессий. Таблица `todos` добавлена миграцией
@@ -100,7 +108,7 @@ bun test
 
 `npm run typecheck` проверяет TypeScript без генерации файлов, а
 `npm run typecheck:tui` — отдельную TUI-панель через `tsconfig.tui.json` и
-ambient-шимы хоста. `bun test` запускает **114 тестов** (11 файлов), включая
+ambient-шимы хоста. `bun test` запускает **125 тестов** (12 файлов), включая
 entrypoint smoke-тест плагина, V2 setup/event-тесты, regression-тесты на
 реальные payload'ы SDK 1.18.x, V2-трансляцию событий, TUI event-контракт,
 glob-контракты с `./`/`..`, индексатор импортов, project-scope агрегаты,

@@ -235,6 +235,7 @@ export function createAgentTools(
           tasks, evidence: storage.listEvidence(root, selectedTask?.id, limit),
           architecture,
           handoff,
+          passport: storage.getLatestPassport(root, (context as Record<string, unknown>).sessionID as string | undefined, selectedTask?.id) || null,
           open_failures: openFailures,
           contracts: storage.listChangeContracts(root, selectedTask?.id).filter((item) => item.status === "active"),
           contradictions: storage.listContradictions(root, "open", limit),
