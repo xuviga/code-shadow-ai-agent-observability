@@ -227,10 +227,10 @@ async function checkDatabase() {
     }
 
     if (schemaChecked) {
-      if (Number.isInteger(schemaVersion) && schemaVersion >= 13) {
-        pass(`shadow DB schema version is ${schemaVersion} (expected >= 13)`)
+      if (Number.isInteger(schemaVersion) && schemaVersion >= 14) {
+        pass(`shadow DB schema version is ${schemaVersion} (expected >= 14)`)
       } else {
-        fail(`shadow DB schema version is ${schemaVersion ?? "missing"}, expected >= 13`)
+        fail(`shadow DB schema version is ${schemaVersion ?? "missing"}, expected >= 14`)
       }
     }
 
@@ -287,6 +287,36 @@ async function checkDatabase() {
     })()
     const fileEdits = tableCount("file_edits")
     const toolExecutions = tableCount("tool_executions")
+
+    try {
+      const untrusted = count(
+        "SELECT COUNT(*) AS n FROM tool_trust WHERE status IN ('changed','suspicious')",
+      )
+      const pinned = count("SELECT COUNT(*) AS n FROM tool_trust")
+      if (untrusted > 0) {
+        warn(`${untrusted} tool(s) changed/suspicious after pinning (of ${pinned} pinned)`)
+      } else {
+        pass(`${pinned} tool fingerprints pinned, no rug-pull signals`)
+      }
+    } catch (error) {
+      fail(`tool_trust check failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    try {
+      const staleClaims = count(
+        `SELECT COUNT(*) AS n FROM file_claims
+         WHERE status = 'active' AND expires_at <= ?`,
+        [Date.now()],
+      )
+      const activeClaims = count("SELECT COUNT(*) AS n FROM file_claims WHERE status = 'active'")
+      if (staleClaims > 0) {
+        warn(`${staleClaims} expired file claim(s) still active (of ${activeClaims})`)
+      } else {
+        pass(`${activeClaims} active file claim(s), none expired`)
+      }
+    } catch (error) {
+      fail(`file_claims check failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
 
     if (
       turnCompleted !== null &&

@@ -8,7 +8,7 @@ import { AgentType, EvidenceStatus, SessionStatus, TaskStepStatus } from "../src
 
 const databases: Array<{ storage: StorageEngine; directory: string }> = []
 
-function createObserverFixture() {
+function createObserverFixture(overrides: Record<string, unknown> = {}) {
   const directory = mkdtempSync(join(tmpdir(), "code-shadow-observer-"))
   const storage = new StorageEngine({
     dbPath: join(directory, "data.db"),
@@ -23,6 +23,7 @@ function createObserverFixture() {
     maxArgsPreviewChars: 200,
     disabledEventTypes: [],
     secretPatterns: [],
+    ...overrides,
   })
   databases.push({ storage, directory })
 
@@ -46,6 +47,7 @@ function createObserverFixture() {
     maxArgsPreviewChars: 200,
     disabledEventTypes: [],
     secretPatterns: [],
+    ...overrides,
   }, log as never)
 
   return { storage, observer }
@@ -833,6 +835,132 @@ describe("Observer", () => {
       allowed = false
     }
     expect(allowed).toBe(true)
+  })
+
+  test("blocks a tool whose description/schema changed after pinning", async () => {
+    const { storage, observer } = createObserverFixture({ toolTrustPolicy: "block" })
+    const sessionId = "observer-trust"
+    await observer.event({
+      event: { type: "session.created", properties: { info: { id: sessionId, directory: "C:/project", time: { created: Date.now() } } } },
+    })
+    const pinned = { projectRoot: "C:/project", serverName: "mcp-db", toolName: "mcp_db_query" }
+    storage.upsertToolTrust({ ...pinned, fingerprint: "fp-initial", descriptionHash: "d1", schemaHash: "s1" })
+    const changed = storage.upsertToolTrust({ ...pinned, fingerprint: "fp-rug-pull", descriptionHash: "d2", schemaHash: "s2" })
+    expect(changed.changed).toBe(true)
+    expect(changed.record.status).toBe("changed")
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "mcp_db_query", sessionID: sessionId, callID: "trust-1" },
+        { args: { sql: "select 1" } },
+      )
+    } catch (error) {
+      blocked = String(error).includes("tool trust")
+    }
+    expect(blocked).toBe(true)
+
+    storage.setToolTrustStatus("C:/project", "mcp_db_query", "trusted")
+    let allowed = true
+    try {
+      await observer["tool.execute.before"](
+        { tool: "mcp_db_query", sessionID: sessionId, callID: "trust-2" },
+        { args: { sql: "select 1" } },
+      )
+    } catch {
+      allowed = false
+    }
+    expect(allowed).toBe(true)
+  })
+
+  test("takes over a claim left by an inactive session", async () => {
+    const { storage, observer } = createObserverFixture()
+    for (const id of ["observer-stale-owner", "observer-stale-next"]) {
+      await observer.event({
+        event: { type: "session.created", properties: { info: { id, directory: "C:/project", time: { created: Date.now() } } } },
+      })
+    }
+    const first = storage.claimFile({
+      projectRoot: "C:/project",
+      filePath: "C:/project/src/shared.ts",
+      sessionId: "observer-stale-owner",
+      ttlMs: 30 * 60 * 1000,
+    })
+    expect(first.claim).toBeTruthy()
+
+    // Simulate an owner that stopped working long ago.
+    const stale = Date.now() - 20 * 60 * 1000
+    storage.getDb().prepare("UPDATE sessions SET started_at = ?1 WHERE id = ?2").run(stale, "observer-stale-owner")
+    storage.getDb().prepare("UPDATE file_claims SET created_at = ?1 WHERE session_id = ?2").run(stale, "observer-stale-owner")
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "write", sessionID: "observer-stale-next", callID: "takeover" },
+        { args: { filePath: "src/shared.ts", content: "next" } },
+      )
+    } catch {
+      blocked = true
+    }
+    expect(blocked).toBe(false)
+    expect(storage.getFileClaim("C:/project", "C:/project/src/shared.ts")?.sessionId).toBe(
+      "observer-stale-next",
+    )
+  })
+
+  test("auto-claims a file for a mutating session and blocks a second session", async () => {
+    const { storage, observer } = createObserverFixture()
+    for (const id of ["observer-claim-a", "observer-claim-b"]) {
+      await observer.event({
+        event: { type: "session.created", properties: { info: { id, directory: "C:/project", time: { created: Date.now() } } } },
+      })
+    }
+    await observer["tool.execute.before"](
+      { tool: "write", sessionID: "observer-claim-a", callID: "claim-a" },
+      { args: { filePath: "src/shared.ts", content: "a" } },
+    )
+    const claim = storage.getFileClaim("C:/project", "C:/project/src/shared.ts")
+    expect(claim?.sessionId).toBe("observer-claim-a")
+
+    let blocked = false
+    try {
+      await observer["tool.execute.before"](
+        { tool: "edit", sessionID: "observer-claim-b", callID: "claim-b" },
+        { args: { filePath: "src/shared.ts" } },
+      )
+    } catch (error) {
+      blocked = String(error).includes("закреплён")
+    }
+    expect(blocked).toBe(true)
+  })
+
+  test("creates a draft passport per actionable turn, attaches files and auto-seals on idle", async () => {
+    const { storage, observer } = createObserverFixture()
+    const sessionId = "observer-auto-passport"
+    await observer.event({
+      event: { type: "session.created", properties: { info: { id: sessionId, directory: "C:/project", time: { created: Date.now() } } } },
+    })
+    await observer["chat.message"]({ sessionID: sessionId, messageID: "p1" }, {
+      parts: [{ type: "text", text: "Implement a safe change in src/a.ts" }],
+    })
+    const draft = storage.getLatestPassport("C:/project", sessionId)
+    expect(draft?.status).toBe("draft")
+    expect(draft?.taskId).toBeTruthy()
+
+    await observer.event({
+      event: { type: "file.edited", properties: { file: "src/a.ts", sessionID: sessionId, projectRoot: "C:/project" } },
+    })
+    const withFile = storage.getLatestPassport("C:/project", sessionId)
+    expect(withFile?.files.some((file) => file.path.endsWith("src/a.ts"))).toBe(true)
+
+    storage.recordEvidence({
+      projectRoot: "C:/project", taskId: draft!.taskId, sessionId,
+      claim: "bun test passed", evidenceType: "command", source: "bash: bun test",
+      status: "verified", confidence: 1, details: null,
+    } as never)
+    await observer.event({ event: { type: "session.idle", properties: { sessionID: sessionId } } })
+    const sealed = storage.getLatestPassport("C:/project", sessionId)
+    expect(sealed?.status === "sealed" || sealed?.status === "blocked").toBe(true)
   })
 
   test("idle writes turn_completed, not a legacy session_completed", async () => {

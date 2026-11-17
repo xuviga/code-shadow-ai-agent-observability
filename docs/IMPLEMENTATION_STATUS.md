@@ -12,7 +12,7 @@
   developer events, todo-изменения, LSP-диагностику и автоматически найденные
   факты.
 - Storage работает на `bun:sqlite`, включает WAL, batch-запись и миграции до
-  версии 13. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
+  версии 14. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
   плагин на полусхеме. Миграция 010 закрепляет natural-key уникальность
   `knowledge_nodes` (file — по `path`, остальные — по `name`, в рамках проекта),
   миграция 011 добавляет FTS5-индекс и триггеры синхронизации памяти,
@@ -64,7 +64,7 @@
 - Базовый тестовый контур находится в `tests/` и покрывает миграции, batch-запись,
   session/LSP/todo-события, нормализацию входных данных и поиск памяти.
 - OpenCode 2 загружает `src/v2.ts` (`exports["."]`): адаптер регистрирует те же
-  17 инструментов и guardrail-хуки, подписывается на 14 V2-событий и переводит
+  18 инструментов и guardrail-хуки, подписывается на 14 V2-событий и переводит
   их в V1-контракты. `session.step.ended.files` даёт `file.edited`,
   `execution.succeeded/interrupted` завершают ход через `session.idle`.
   Ограничения V2 (нет todo/LSP, `tui.command.execute` — только частичная замена
@@ -82,13 +82,14 @@
 
 ## Фактическая схема SQLite
 
-В свежей базе после миграций присутствуют 21 таблица:
+В свежей базе после миграций присутствуют 22 таблицы:
 
 `schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`,
 `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`,
 `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`,
 `failure_memory`, `change_contracts`, `contradiction_records`,
-`provenance_events`, `agent_handoffs`, `change_passports`, `file_claims`.
+`provenance_events`, `agent_handoffs`, `change_passports`, `file_claims`,
+`tool_trust`.
 
 Таблица `developer_profile` в текущей реализации отсутствует: статистика
 разработчика вычисляется из событий и сессий. Таблица `todos` добавлена миграцией
@@ -108,7 +109,7 @@ bun test
 
 `npm run typecheck` проверяет TypeScript без генерации файлов, а
 `npm run typecheck:tui` — отдельную TUI-панель через `tsconfig.tui.json` и
-ambient-шимы хоста. `bun test` запускает **125 тестов** (12 файлов), включая
+ambient-шимы хоста. `bun test` запускает **146 тестов** (13 файлов), включая
 entrypoint smoke-тест плагина, V2 setup/event-тесты, regression-тесты на
 реальные payload'ы SDK 1.18.x, V2-трансляцию событий, TUI event-контракт,
 glob-контракты с `./`/`..`, индексатор импортов, project-scope агрегаты,

@@ -513,6 +513,24 @@ export interface FileClaim {
   releasedAt: number | null;
 }
 
+/** Статус доверия к описанию инструмента/MCP-сервера. */
+export type ToolTrustStatus = "trusted" | "changed" | "blocked" | "suspicious";
+
+/** tool_trust — закреплённый отпечаток инструмента для защиты от rug pull. */
+export interface ToolTrustRecord {
+  id: string;
+  projectRoot: string;
+  serverName: string | null;
+  toolName: string;
+  fingerprint: string;
+  descriptionHash: string | null;
+  schemaHash: string | null;
+  status: ToolTrustStatus;
+  firstSeen: number;
+  lastSeen: number;
+  metadata: Record<string, unknown> | null;
+}
+
 // ---------------------------------------------------------------------------
 // Аналитические типы
 // ---------------------------------------------------------------------------
@@ -724,6 +742,10 @@ export interface ShadowConfig {
   secretPatterns: string[];
   /** Как реагировать на разрушительные shell-команды: block (default) или warn. */
   destructiveActionPolicy?: "block" | "warn";
+  /** Как реагировать на изменение описания/схемы инструмента: warn (default) или block. */
+  toolTrustPolicy?: "warn" | "block";
+  fileClaimPolicy?: "block" | "warn";
+  fileClaimStaleMs?: number;
 }
 
 /** Элемент очереди пакетной записи */

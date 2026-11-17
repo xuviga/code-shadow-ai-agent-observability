@@ -909,6 +909,30 @@ export default Plugin.define({
               log(`failed to add tool ${name}:`, err)
             }
           }
+
+          // Pin every registered tool's description/schema and surface
+          // changed or suspicious ones. Never fail tool registration.
+          try {
+            const editorWithList = editor as unknown as { list?: () => unknown }
+            const infos =
+              typeof editorWithList.list === "function" ? editorWithList.list() : []
+            const changes = hooks.syncToolTrust?.(
+              ctx.location.directory,
+              infos as any[],
+            ) as Array<{ toolName?: string; status?: string }> | undefined
+            if (changes?.length) {
+              log(`tool trust: ${changes.length} changed/suspicious`)
+              writeV2Log(
+                "tool trust changes",
+                changes.map((record) => ({
+                  tool: record.toolName,
+                  status: record.status,
+                })),
+              )
+            }
+          } catch (err) {
+            log("tool trust scan failed:", err)
+          }
         }),
       `tools (${Object.keys(v1Tools).length})`,
     )

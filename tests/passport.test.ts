@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { execFileSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,7 +8,9 @@ import { createPassportTool } from "../src/tools/passport"
 import {
   classifyDestructiveCommand,
   computePassportHash,
+  isShellLikeTool,
   scanAlmostRight,
+  scanDiffForAlmostRight,
 } from "../src/passport"
 import { AgentType, SessionStatus, TaskStatus } from "../src/types"
 
@@ -86,6 +89,19 @@ function createSession(storage: StorageEngine, project: string, id = "ses_passpo
   return id
 }
 
+const hasGit = (() => {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" })
+    return true
+  } catch {
+    return false
+  }
+})()
+
+function git(project: string, args: string[]): void {
+  execFileSync("git", ["-C", project, ...args], { stdio: "ignore" })
+}
+
 afterEach(() => {
   while (fixtures.length > 0) {
     const item = fixtures.pop()!
@@ -130,6 +146,107 @@ describe("Almost-right scanner", () => {
     // Search commands often contain destructive words as grep patterns.
     expect(classifyDestructiveCommand("Select-String -Path tests/*.ts -Pattern 'rm -rf|DROP TABLE'")).toEqual([])
     expect(classifyDestructiveCommand("grep -R 'DELETE FROM' src")).toEqual([])
+  })
+
+  test("only shell-like tools can execute a command", () => {
+    expect(isShellLikeTool("bash")).toBe(true)
+    expect(isShellLikeTool("PowerShell")).toBe(true)
+    expect(isShellLikeTool("edit")).toBe(false)
+    expect(isShellLikeTool("write")).toBe(false)
+    expect(isShellLikeTool("code_shadow_passport")).toBe(false)
+  })
+})
+
+describe("Diff-aware almost-right scanner", () => {
+  test("scans only added lines and reports new-file line numbers", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "index 1111111..2222222 100644",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,3 @@",
+      " const context = 1",
+      "+try { run() } catch {}",
+      "+const x: any = 1",
+    ].join("\n")
+    const findings = scanDiffForAlmostRight(diff, "src/a.ts")
+    const silentCatch = findings.find((item) => item.kind === "silent-catch")
+    expect(silentCatch?.severity).toBe("error")
+    expect(silentCatch?.file).toBe("src/a.ts")
+    expect(silentCatch?.line).toBe(2)
+    const asAny = findings.find((item) => item.kind === "as-any")
+    expect(asAny?.severity).toBe("info")
+    expect(asAny?.line).toBe(3)
+  })
+
+  test("does not flag legacy patterns in context or removed lines", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,3 +1,3 @@",
+      " try { run() } catch {}",
+      "-const value = 1",
+      "+const value = 2",
+    ].join("\n")
+    expect(scanDiffForAlmostRight(diff, "src/a.ts")).toEqual([])
+  })
+
+  test("tracks line numbers across hunks", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -10,1 +10,1 @@",
+      "-const a = 1",
+      "+try {} catch {}",
+      "@@ -20,1 +20,1 @@",
+      "+const y: any = 1",
+    ].join("\n")
+    const findings = scanDiffForAlmostRight(diff, "src/a.ts")
+    expect(findings.find((item) => item.kind === "silent-catch")?.line).toBe(10)
+    expect(findings.find((item) => item.kind === "as-any")?.line).toBe(20)
+  })
+
+  test("reports a removed assertion when no assertion was added", () => {
+    const diff = [
+      "diff --git a/tests/a.test.ts b/tests/a.test.ts",
+      "--- a/tests/a.test.ts",
+      "+++ b/tests/a.test.ts",
+      "@@ -4,2 +4,1 @@",
+      "-expect(value).toBe(1)",
+      " const other = 2",
+    ].join("\n")
+    const findings = scanDiffForAlmostRight(diff, "tests/a.test.ts")
+    expect(findings).toHaveLength(1)
+    expect(findings[0].kind).toBe("test-assertion-removed")
+    expect(findings[0].severity).toBe("warning")
+    expect(findings[0].line).toBe(4)
+  })
+
+  test("a replaced assertion is not reported as removed", () => {
+    const diff = [
+      "--- a/tests/a.test.ts",
+      "+++ b/tests/a.test.ts",
+      "@@ -1,2 +1,2 @@",
+      "-expect(a).toBe(1)",
+      "+expect(a).toBe(2)",
+      " const other = 3",
+    ].join("\n")
+    expect(scanDiffForAlmostRight(diff, "tests/a.test.ts")).toEqual([])
+  })
+
+  test("returns nothing for a clean diff", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,1 +1,1 @@",
+      "-export const value = 1",
+      "+export const value = 2",
+    ].join("\n")
+    expect(scanDiffForAlmostRight(diff, "src/a.ts")).toEqual([])
+    expect(scanDiffForAlmostRight("", "src/a.ts")).toEqual([])
   })
 })
 
@@ -210,6 +327,56 @@ describe("Change Passport", () => {
     expect(sealed.passport.status).toBe("sealed")
     expect(sealed.passport.taskId).toBe(task.id)
     expect(sealed.passport.intent).toContain("Seal the change")
+  })
+
+  test("untracked files are scanned in full during seal", async () => {
+    const { storage, tool, project } = createFixture()
+    const sessionId = createSession(storage, project, "ses_untracked_passport")
+    // No git repo / untracked path: the seal has no diff to inspect, so it
+    // must fall back to the full-file scanner.
+    writeFileSync(join(project, "src", "a.ts"), "try { run() } catch {}\n", "utf8")
+    const sealed = await call(tool, {
+      action: "seal",
+      intent: "Untracked fallback",
+      files: ["src/a.ts"],
+    }, { sessionID: sessionId, directory: project, agent: "build" })
+    expect(sealed.passport.findings.some((item: any) => item.kind === "silent-catch")).toBe(true)
+  })
+
+  test.skipIf(!hasGit)("seals a tracked file from its diff, ignoring untouched legacy code", async () => {
+    const { storage, tool, project } = createFixture()
+    const sessionId = createSession(storage, project)
+    writeFileSync(
+      join(project, "src", "a.ts"),
+      "try { run() } catch {}\nexport const value = 1\n",
+      "utf8",
+    )
+    git(project, ["init"])
+    git(project, ["add", "-A"])
+    git(project, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"])
+
+    const context = { sessionID: sessionId, directory: project, agent: "build" }
+    const opened = await call(tool, {
+      action: "open",
+      intent: "Diff-aware seal",
+      files: ["src/a.ts"],
+    }, context)
+
+    // Unchanged relative to HEAD: the legacy empty catch must not block.
+    const unchanged = await call(tool, { action: "seal", passport_id: opened.passport.id }, context)
+    expect(unchanged.passport.findings.some((item: any) => item.kind === "silent-catch")).toBe(false)
+
+    // Only the added line is scanned; the legacy catch stays untouched.
+    writeFileSync(
+      join(project, "src", "a.ts"),
+      "try { run() } catch {}\nexport const value = 2\nconst extra: any = 1\n",
+      "utf8",
+    )
+    const changed = await call(tool, { action: "seal", passport_id: opened.passport.id }, context)
+    expect(changed.passport.findings.some((item: any) => item.kind === "silent-catch")).toBe(false)
+    const asAny = changed.passport.findings.find((item: any) => item.kind === "as-any")
+    expect(asAny?.severity).toBe("info")
+    expect(asAny?.line).toBe(3)
   })
 
   test("a passport hash changes when evidence/risk changes", () => {

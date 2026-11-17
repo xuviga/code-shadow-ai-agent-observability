@@ -6,6 +6,20 @@ All notable changes to Code Shadow are documented here.
 
 ### Added
 
+- **Tool trust registry**: `code_shadow_tool_trust` (18th tool) pins MCP and
+  tool descriptions/schemas, flags prompt-injection heuristics, detects
+  rug pulls when a fingerprint changes after pinning, and enforces
+  `toolTrustPolicy` (`warn`/`block`) in the observer. V2 scans `editor.list()`
+  at startup (migration 014, `tool_trust`).
+- **Automatic passports and file ownership**: every actionable turn opens a
+  draft passport, `file.edited` attaches files, `session.idle` auto-seals and
+  releases claims; mutating tools auto-claim their targets, a live conflict
+  blocks the edit, and a claim left by an inactive session is taken over after
+  `fileClaimStaleMs` (5 min default).
+- **Diff-aware almost-right scanner**: tracked files are scanned through
+  `git diff --unified=0 <base_ref|HEAD>`, so legacy patterns in untouched code
+  no longer create noise; new/untracked files are scanned in full, and removed
+  assertions are reported as `test-assertion-removed`.
 - **Proof-Carrying Change**: `code_shadow_passport` (17th tool) seals each
   change with intent, file hashes, almost-right findings, Change Contract,
   verified evidence, destructive-command checks, file claims, token budget,

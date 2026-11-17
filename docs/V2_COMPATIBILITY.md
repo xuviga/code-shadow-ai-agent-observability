@@ -12,7 +12,7 @@ StorageEngine/Observer/tools и переводит V2 API в V1-контракт
 
 | Что регистрируется | V2 API |
 |---|---|
-| 17 инструментов `code_shadow_*` | `ctx.tool.transform` (`codemode: false`) |
+| 18 инструментов `code_shadow_*` | `ctx.tool.transform` (`codemode: false`) |
 | Guardrails до/после инструмента | `ctx.tool.hook("execute.before")`, `ctx.tool.hook("execute.after")` |
 | Auto-task из пользовательского запроса | `ctx.session.hook("prompt")` |
 | Briefing при компактизации | `ctx.session.hook("compaction")` |
@@ -195,5 +195,5 @@ bun test tests/v2-events.test.ts tests/v2-setup.test.ts tests/tui-v2.test.ts
 
 Для ручной проверки в OpenCode 2 смотрите
 `~/.local/share/opencode/log/code-shadow-v2.log`: там фиксируются
-`registered <hook>`, `v2 event subscription (14)` и `v2 registry (17)`.
+`registered <hook>`, `v2 event subscription (14)` и `v2 registry (18)`.
 Ошибки трансляции событий пишутся туда же и не роняют хост.

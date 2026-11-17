@@ -51,16 +51,20 @@ describe("StorageEngine", () => {
     const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'todos'").get()
     const errorFileIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_errors_file'").get()
 
-    expect(version.version).toBe(13)
+    expect(version.version).toBe(14)
     expect(table).toBeTruthy()
     expect(errorFileIndex).toBeTruthy()
     const uniqueEdgeIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ke_unique'").get()
     expect(uniqueEdgeIndex).toBeTruthy()
-    for (const name of ["agent_tasks", "task_steps", "evidence_records", "failure_memory", "change_contracts", "contradiction_records", "provenance_events", "agent_handoffs", "change_passports", "file_claims"]) {
+    for (const name of ["agent_tasks", "task_steps", "evidence_records", "failure_memory", "change_contracts", "contradiction_records", "provenance_events", "agent_handoffs", "change_passports", "file_claims", "tool_trust"]) {
       expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1").get(name)).toBeTruthy()
     }
     const activeClaimIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_file_claims_active'").get()
     expect(activeClaimIndex).toBeTruthy()
+    const toolTrustStatusIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_tool_trust_project_status'").get()
+    const toolTrustToolIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_tool_trust_tool'").get()
+    expect(toolTrustStatusIndex).toBeTruthy()
+    expect(toolTrustToolIndex).toBeTruthy()
     const knColumns = db.prepare(`PRAGMA table_info("knowledge_nodes")`).all() as Array<{ name: string }>
     const decisionColumns = db.prepare(`PRAGMA table_info("decisions")`).all() as Array<{ name: string }>
     expect(knColumns.some((column) => column.name === "project_root")).toBe(true)
@@ -857,5 +861,84 @@ describe("StorageEngine", () => {
     })
     expect(previews[1].toolName).toBe("read")
     expect(storage.getToolExecutionPreviews("ses_files", 1)).toHaveLength(1)
+  })
+
+  test("pins tool trust fingerprints and detects description changes", () => {
+    const storage = createStorage()
+    const project = "C:/project"
+
+    const first = storage.upsertToolTrust({
+      projectRoot: project, serverName: "mcp-demo", toolName: "read_file",
+      fingerprint: "fp-1", descriptionHash: "desc-1", schemaHash: "schema-1",
+      metadata: { server: "mcp-demo" },
+    })
+    expect(first.changed).toBe(false)
+    expect(first.previousStatus).toBeNull()
+    expect(first.record.status).toBe("trusted")
+    expect(first.record.serverName).toBe("mcp-demo")
+    expect(first.record.metadata).toEqual({ server: "mcp-demo" })
+
+    const same = storage.upsertToolTrust({
+      projectRoot: project, toolName: "read_file", fingerprint: "fp-1",
+      descriptionHash: "desc-1", schemaHash: "schema-1",
+    })
+    expect(same.changed).toBe(false)
+    expect(same.previousStatus).toBe("trusted")
+    expect(same.record.status).toBe("trusted")
+    expect(same.record.firstSeen).toBe(first.record.firstSeen)
+    expect(same.record.descriptionHash).toBe("desc-1")
+
+    const changed = storage.upsertToolTrust({
+      projectRoot: project, toolName: "read_file", fingerprint: "fp-2",
+      descriptionHash: "desc-2", schemaHash: "schema-2",
+    })
+    expect(changed.changed).toBe(true)
+    expect(changed.previousStatus).toBe("trusted")
+    expect(changed.record.status).toBe("changed")
+    expect(changed.record.fingerprint).toBe("fp-2")
+    expect(changed.record.descriptionHash).toBe("desc-2")
+    expect(changed.record.schemaHash).toBe("schema-2")
+
+    // A second project keeps its own pinned fingerprint.
+    storage.upsertToolTrust({ projectRoot: "C:/other", toolName: "read_file", fingerprint: "fp-1" })
+    expect(storage.getToolTrust("C:/other", "read_file")?.status).toBe("trusted")
+    expect(storage.listToolTrust(project)).toHaveLength(1)
+  })
+
+  test("sets tool trust status and lists by status", () => {
+    const storage = createStorage()
+    const project = "C:/project"
+
+    storage.upsertToolTrust({ projectRoot: project, toolName: "mcp__demo__write", fingerprint: "fp-1" })
+    storage.upsertToolTrust({ projectRoot: project, toolName: "mcp__demo__read", fingerprint: "fp-2" })
+
+    const blocked = storage.setToolTrustStatus(project, "mcp__demo__write", "blocked")
+    expect(blocked?.status).toBe("blocked")
+    expect(storage.setToolTrustStatus(project, "missing_tool", "trusted")).toBeUndefined()
+
+    const blockedList = storage.listToolTrust(project, "blocked")
+    expect(blockedList).toHaveLength(1)
+    expect(blockedList[0].toolName).toBe("mcp__demo__write")
+    expect(storage.listToolTrust(project, "trusted")).toHaveLength(1)
+  })
+
+  test("releaseSessionClaims releases claims for one session only", () => {
+    const storage = createStorage()
+    const project = "C:/project"
+
+    storage.claimFile({ projectRoot: project, filePath: "src/a.ts", sessionId: "ses_claim_a" })
+    storage.claimFile({ projectRoot: project, filePath: "src/b.ts", sessionId: "ses_claim_a" })
+    storage.claimFile({ projectRoot: project, filePath: "src/c.ts", sessionId: "ses_claim_b" })
+
+    expect(storage.releaseSessionClaims("ses_claim_a")).toBe(2)
+    expect(storage.releaseSessionClaims("ses_claim_a")).toBe(0)
+
+    const rows = storage.getDb().prepare(
+      "SELECT session_id, status, released_at FROM file_claims ORDER BY file_path",
+    ).all() as Array<{ session_id: string; status: string; released_at: number | null }>
+    const sessionA = rows.filter((row) => row.session_id === "ses_claim_a")
+    expect(sessionA).toHaveLength(2)
+    expect(sessionA.every((row) => row.status === "released" && row.released_at !== null)).toBe(true)
+    expect(rows.find((row) => row.session_id === "ses_claim_b")?.status).toBe("active")
   })
 })

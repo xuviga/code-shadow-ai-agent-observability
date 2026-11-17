@@ -12,7 +12,8 @@ import { NodeType } from "./types"
 import { sanitizeContent } from "./config"
 import { pathMatches } from "./path-match"
 import { normalizeProjectPath } from "./project-path"
-import { classifyDestructiveCommand } from "./passport"
+import { classifyDestructiveCommand, isShellLikeTool } from "./passport"
+import { sealPassport } from "./tools/passport"
 import type { createLogger } from "./logger"
 import * as path from "node:path"
 
@@ -66,6 +67,14 @@ interface StorageEngineLike {
   getOpenTaskForSession(sessionId: string): any | undefined
   getLatestPassport(projectRoot: string, sessionId?: string, taskId?: string): any | undefined
   getFileClaim(projectRoot: string, filePath: string, now?: number): any | undefined
+  getSessionLastActivityAt(sessionId: string): number | null
+  getToolTrust(projectRoot: string, toolName: string): any | undefined
+  getSessionChangedFiles(sessionId: string, limit?: number): string[]
+  claimFile(input: { projectRoot: string; filePath: string; sessionId: string; agent?: string | null; note?: string | null; ttlMs?: number }): { claim: any; conflict: any }
+  releaseFileClaim(projectRoot: string, filePath: string, sessionId: string): boolean
+  releaseSessionClaims(sessionId: string): number
+  createPassport(input: any): any
+  updatePassport(id: string, patch: any): any | undefined
   recordEvidence(input: any): any
 }
 
@@ -129,6 +138,27 @@ class DestructiveCommandGuardError extends Error {
         `Причины: ${reasons.join(", ")}. Создай Change Passport с allow_destructive=true после осознанного подтверждения.`,
     )
     this.name = "DestructiveCommandGuardError"
+  }
+}
+
+class FileClaimConflictError extends Error {
+  constructor(filePath: string, ownerSession: string) {
+    super(
+      `[Code Shadow] файл ${filePath} уже закреплён за сессией ${ownerSession}. ` +
+        `Сначала release/claim в code_shadow_passport, затем повтори правку.`,
+    )
+    this.name = "FileClaimConflictError"
+  }
+}
+
+class ToolTrustGuardError extends Error {
+  constructor(toolName: string, status: string) {
+    super(
+      `[Code Shadow] инструмент ${toolName} заблокирован политикой tool trust (статус ${status}). ` +
+        `Описание или схема изменились после пиннинга — проверь code_shadow_tool_trust action="get" ` +
+        `и подтверди trust, если изменение ожидаемо.`,
+    )
+    this.name = "ToolTrustGuardError"
   }
 }
 
@@ -892,6 +922,64 @@ export function createObserver(
     return ["Выполнить запрос пользователя"]
   }
 
+  function autoSealDraftPassport(sessionId: string, projectRoot: string): void {
+    try {
+      const draft = storage.getLatestPassport(projectRoot, sessionId)
+      if (!draft || draft.status !== "draft") return
+      const changed = storage.getSessionChangedFiles(sessionId, 1)
+      if (changed.length === 0) return
+      const sealed = sealPassport(storage as any, config, draft.id, log)
+      log.info(
+        `Auto-Passport ${draft.id}: ${sealed.status} (risk=${sealed.riskScore}, findings=${sealed.findings.length})`,
+      )
+    } catch (err) {
+      log.debug(`Auto-Passport seal пропущен: ${String(err)}`)
+    }
+  }
+
+  function ensureDraftPassport(
+    projectRoot: string,
+    sessionId: string,
+    taskId: string | null,
+    intent: string,
+    agentType?: string,
+  ): any {
+    try {
+      const existing = storage.getLatestPassport(projectRoot, sessionId, taskId ?? undefined)
+      if (existing && existing.status === "draft") {
+        if (existing.intent !== intent) {
+          return storage.updatePassport(existing.id, { intent })
+        }
+        return existing
+      }
+      return storage.createPassport({
+        projectRoot,
+        sessionId,
+        taskId: taskId ?? null,
+        contractId: null,
+        intent: intent || "Agent change in the current session",
+        status: "draft",
+        riskScore: 0,
+        riskLevel: "low",
+        files: [],
+        evidenceIds: [],
+        checks: [],
+        findings: [],
+        budgetTokens: null,
+        tokensUsed: 0,
+        allowDestructive: false,
+        agent: agentType || null,
+        model: null,
+        baseRef: null,
+        rollbackPlan: null,
+        reviewMd: null,
+      })
+    } catch (err) {
+      log.debug(`Auto-Passport draft пропущен: ${String(err)}`)
+      return undefined
+    }
+  }
+
   async function handleChatMessage(
     input: { sessionID: string; messageID?: string; agent?: string },
     output: { parts: Array<Record<string, unknown>> },
@@ -919,30 +1007,40 @@ export function createObserver(
 
       // One open auto-task per session. A direct lookup is not limited by
       // listTasks' recent-10 window, so an old task cannot be bypassed.
-      const existing = storage.getOpenTaskForSession(input.sessionID)
-      if (existing) return
-
-      const title = (text.split(/[.!?\n]/)[0] || text).slice(0, 120).trim()
-      const task = storage.createTask({
-        projectRoot: session.projectRoot,
-        sessionId: input.sessionID,
-        title: title || "User request",
-        goal: text.slice(0, 2000),
-        status: "active",
-        priority: 50,
-        metadata: { source: "chat.message", message_id: input.messageID || null, auto_created: true },
-      })
-      for (const [position, stepTitle] of inferTaskPlan(text).entries()) {
-        storage.addTaskStep({
-          taskId: task.id,
-          title: stepTitle,
-          status: position === 0 ? "in_progress" : "pending",
-          position,
-          blockedBy: null,
-          metadata: { auto_created: true, plan_source: "heuristic" },
+      let task = storage.getOpenTaskForSession(input.sessionID)
+      if (!task) {
+        const title = (text.split(/[.!?\n]/)[0] || text).slice(0, 120).trim()
+        task = storage.createTask({
+          projectRoot: session.projectRoot,
+          sessionId: input.sessionID,
+          title: title || "User request",
+          goal: text.slice(0, 2000),
+          status: "active",
+          priority: 50,
+          metadata: { source: "chat.message", message_id: input.messageID || null, auto_created: true },
         })
+        for (const [position, stepTitle] of inferTaskPlan(text).entries()) {
+          storage.addTaskStep({
+            taskId: task.id,
+            title: stepTitle,
+            status: position === 0 ? "in_progress" : "pending",
+            position,
+            blockedBy: null,
+            metadata: { auto_created: true, plan_source: "heuristic" },
+          })
+        }
+        log.info(`Auto-Task создана из user message: ${task.id} — ${title}`)
       }
-      log.info(`Auto-Task создана из user message: ${task.id} — ${title}`)
+
+      // Every actionable turn gets a draft Change Passport immediately; files
+      // are attached by file.edited and it is auto-sealed on session.idle.
+      ensureDraftPassport(
+        session.projectRoot,
+        input.sessionID,
+        task.id,
+        sanitizeContent(text.slice(0, 2000), config.secretPatterns),
+        session.agentType,
+      )
     } catch (err) {
       log.debug(`Auto-Task из chat.message пропущена: ${String(err)}`)
     }
@@ -1064,7 +1162,7 @@ export function createObserver(
       // path, otherwise a successful file write would reset the edit-loop
       // guard accidentally. Only an explicit command argument counts.
       if (isMutatingFileTool(toolName)) return
-      const isShellTool = /^(bash|shell|exec|command|run|terminal|powershell|pwsh|cmd)$/i.test(toolName)
+      const isShellTool = isShellLikeTool(toolName)
       const hasExplicitCommand = typeof args.command === "string" || typeof args.cmd === "string"
       if (!isShellTool && !hasExplicitCommand) return
       const command = extractCommand(args)
@@ -1244,6 +1342,24 @@ export function createObserver(
     throw new SuccessfulEditLoopGuardError(filePath, state.count)
   }
 
+  function attachDraftFile(sessionId: string, projectRoot: string, filePath: string): void {
+    if (!sessionId || sessionId === "unknown" || !projectRoot) return
+    try {
+      const draft = storage.getLatestPassport(projectRoot, sessionId)
+      if (!draft || draft.status !== "draft") return
+      const normalized = normalizeProjectPath(projectRoot, filePath)
+      if (draft.files.some((file: any) => file.path === normalized)) return
+      storage.updatePassport(draft.id, {
+        files: [
+          ...draft.files,
+          { path: normalized, editType: "update", linesAdded: 0, linesRemoved: 0, hash: null },
+        ],
+      })
+    } catch (err) {
+      log.debug(`Passport file attach пропущен: ${String(err)}`)
+    }
+  }
+
   async function handleFileEdited(properties: Record<string, unknown>): Promise<void> {
     try {
       const filePath = (properties.file as string) || (properties.filePath as string) || (properties.path as string) || "unknown"
@@ -1342,6 +1458,7 @@ export function createObserver(
         sessionFilesMap.set(sessionId, new Set())
       }
       sessionFilesMap.get(sessionId)!.add(filePath)
+      attachDraftFile(sessionId, projectRoot, filePath)
 
       // Auto-Memory: обнаружение фактов о проекте (project-scoped)
       void autoDetectFromFile(storage, filePath, log, projectRoot)
@@ -1627,6 +1744,14 @@ export function createObserver(
         sessionFilesMap.delete(sessionId)
       } catch (_err) {
         // Silently fail on auto-summary
+      }
+
+      // Auto-seal the turn's passport before the task can be completed.
+      autoSealDraftPassport(sessionId, session.projectRoot as string)
+      try {
+        storage.releaseSessionClaims(sessionId)
+      } catch (err) {
+        log.debug(`Release session claims пропущен: ${String(err)}`)
       }
 
       crushDirty = true
@@ -2190,10 +2315,45 @@ export function createObserver(
       const timingKey = `${sessionId}:${callId}`
       toolStartTimes.set(timingKey, Date.now())
 
+      // MCP/tool trust pin: a tool whose description or schema changed after
+      // pinning is a rug-pull candidate. Warn or block by policy.
+      try {
+        const session = storage.getSession(sessionId)
+        const trust = session ? storage.getToolTrust(session.projectRoot, toolName) : undefined
+        if (
+          trust &&
+          (trust.status === "changed" ||
+            trust.status === "suspicious" ||
+            trust.status === "blocked")
+        ) {
+          const policy = config.toolTrustPolicy ?? "warn"
+          const blocking = policy === "block"
+          storage.enqueue("developer_events", {
+            event_type: blocking ? "tool_rejected" : "tool_warning",
+            session_id: sessionId,
+            file_path: null,
+            metadata: JSON.stringify({
+              reason: "tool_trust",
+              blocking,
+              severity: blocking ? "critical" : "warning",
+              tool: toolName,
+              trust_status: trust.status,
+              fingerprint: trust.fingerprint,
+            }),
+            timestamp: Date.now(),
+          })
+          if (blocking) throw new ToolTrustGuardError(toolName, trust.status)
+          log.warn(`Tool trust ${trust.status}: ${toolName}`)
+        }
+      } catch (err) {
+        if (err instanceof ToolTrustGuardError) throw err
+        log.debug(`tool trust check пропущен: ${String(err)}`)
+      }
+
       // Proof-Carrying Change firewall: destructive shell commands are blocked
       // unless a passport for this session/task explicitly allows them.
       const command = extractCommand(output.args || {})
-      const isShellTool = /^(bash|shell|exec|command|run|terminal|powershell|pwsh|cmd)$/i.test(toolName)
+      const isShellTool = isShellLikeTool(toolName)
       const hasExplicitCommand =
         typeof output.args?.command === "string" || typeof output.args?.cmd === "string"
       if (command && (isShellTool || hasExplicitCommand)) {
@@ -2246,23 +2406,75 @@ export function createObserver(
         if (targets.length > 0 && session) {
           for (const target of targets) {
             const normalizedTarget = normalizeProjectPath(session.projectRoot, target)
-            const claim = storage.getFileClaim(session.projectRoot, normalizedTarget)
-            if (claim && claim.sessionId !== sessionId) {
+            // Automatic cooperative ownership: every mutating session claims
+            // its target for 30 minutes; idle releases all its claims.
+            const result = storage.claimFile({
+              projectRoot: session.projectRoot,
+              filePath: normalizedTarget,
+              sessionId,
+              agent: session.agentType || null,
+              note: `auto-claim ${toolName}`,
+              ttlMs: 30 * 60 * 1000,
+            })
+            if (result.conflict) {
+              // A claim is a hint from a live agent. If its owner is gone (a
+              // finished subagent, a crashed session), the claim must not block
+              // the project forever: release it and take over.
+              const ownerId = result.conflict.sessionId as string
+              const owner = storage.getSession(ownerId)
+              const lastActivity = storage.getSessionLastActivityAt(ownerId)
+              const staleAfterMs = config.fileClaimStaleMs ?? 5 * 60 * 1000
+              // Reference point is the owner's last observable activity, not the
+              // claim age: a subagent that claimed a file and then finished must
+              // not keep it for the full TTL.
+              const reference = lastActivity ?? result.conflict.createdAt ?? 0
+              const ownerStale =
+                !owner || owner.status !== "active" || Date.now() - reference > staleAfterMs
+              if (ownerStale) {
+                storage.releaseFileClaim(session.projectRoot, normalizedTarget, ownerId)
+                storage.enqueue("developer_events", {
+                  event_type: "tool_warning",
+                  session_id: sessionId,
+                  file_path: normalizedTarget,
+                  metadata: JSON.stringify({
+                    reason: "stale_file_claim_released",
+                    blocking: false,
+                    severity: "info",
+                    previous_owner: ownerId,
+                    idle_ms: Date.now() - reference,
+                  }),
+                  timestamp: Date.now(),
+                })
+                log.info(`Stale file claim released: ${normalizedTarget} (owner ${ownerId})`)
+                const retry = storage.claimFile({
+                  projectRoot: session.projectRoot,
+                  filePath: normalizedTarget,
+                  sessionId,
+                  agent: session.agentType || null,
+                  note: `takeover ${toolName}`,
+                  ttlMs: 30 * 60 * 1000,
+                })
+                if (!retry.conflict) continue
+              }
+              const policy = config.fileClaimPolicy ?? "block"
               storage.enqueue("developer_events", {
-                event_type: "tool_warning",
+                event_type: policy === "block" ? "tool_rejected" : "tool_warning",
                 session_id: sessionId,
                 file_path: normalizedTarget,
                 metadata: JSON.stringify({
                   reason: "file_claim_conflict",
-                  blocking: false,
-                  severity: "warning",
+                  blocking: policy === "block",
+                  severity: policy === "block" ? "error" : "warning",
                   tool: toolName,
-                  owner_session: claim.sessionId,
-                  claim_id: claim.id,
+                  owner_session: result.conflict.sessionId,
+                  claim_id: result.conflict.id,
                 }),
                 timestamp: Date.now(),
               })
-              log.warn(`File claim conflict: ${normalizedTarget} held by ${claim.sessionId}`)
+              log.warn(`File claim conflict: ${normalizedTarget} held by ${result.conflict.sessionId}`)
+              if (policy === "block") {
+                throw new FileClaimConflictError(normalizedTarget, result.conflict.sessionId)
+              }
             }
           }
           try {
@@ -2292,7 +2504,12 @@ export function createObserver(
         log.debug(`tool.execute.before: ${toolName} (сессия: ${sessionId})`)
       }
     } catch (err) {
-      if (err instanceof SuccessfulEditLoopGuardError || err instanceof DestructiveCommandGuardError) {
+      if (
+        err instanceof SuccessfulEditLoopGuardError ||
+        err instanceof DestructiveCommandGuardError ||
+        err instanceof FileClaimConflictError ||
+        err instanceof ToolTrustGuardError
+      ) {
         throw err
       }
       log.error("Ошибка в toolExecuteBefore", err)

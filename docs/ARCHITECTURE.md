@@ -21,12 +21,14 @@ Code Shadow — локальный плагин OpenCode: постоянная �
 
 | Модуль | Ответственность |
 |---|---|
-| `src/index.ts` | точка входа: конфиг, StorageEngine, observer, TUI-хуки, 17 инструментов, интервалы, `dispose`, CRUSH.md/AGENTS.md |
+| `src/index.ts` | точка входа: конфиг, StorageEngine, observer, TUI-хуки, 18 инструментов, интервалы, `dispose`, CRUSH.md/AGENTS.md |
 | `src/storage.ts` | SQLite/WAL, миграции, CRUD, аналитические агрегаты, batch-очередь, retention |
 | `src/observer.ts` | приём событий/хуков, телеметрия, auto-memory, auto-task, auto-evidence, guardrails |
 | `src/tools/agent.ts` | Task Graph, Evidence, Failure Memory, Change Contract, Context Router, Counterfactual, Handoff, Insight, Contradiction, Provenance |
 | `src/passport.ts` | Proof-Carrying Change: almost-right scanner, destructive-command classifier, risk, hash-chain, review packet |
 | `src/tools/passport.ts` | `code_shadow_passport` и file claims |
+| `src/tool-trust.ts` | fingerprint описаний/схем инструментов, эвристики prompt injection, batch-синхронизация |
+| `src/tools/trust.ts` | `code_shadow_tool_trust` (list/get/trust/block/scan/verify) |
 | `src/tools/analyze.ts` | `code_shadow_analyze` (9 режимов) |
 | `src/tools/memory.ts` | `code_shadow_memory_write/search/note` |
 | `src/tools/context.ts` | `code_shadow_context_inject` |
@@ -71,7 +73,7 @@ OpenCode event/hook
 5. `ensureCrushMd` и `ensureTuiPlugin`: один блок инструкций пишется в
    `CRUSH.md` (OpenCode 1) и `AGENTS.md` (OpenCode 2) с сохранением
    пользовательского текста вне маркеров; установка/мерж `tui.json`.
-6. Регистрация 17 инструментов и observer/TUI-хуков.
+6. Регистрация 18 инструментов и observer/TUI-хуков.
 7. `dispose` (или exit/SIGINT/SIGTERM): снять интервалы и process-listeners,
    flush, закрыть БД.
 
@@ -139,9 +141,24 @@ review Markdown.
 требует `status=sealed`, если у задачи есть паспорт. `file_claims` дают
 кооперативную блокировку файлов между несколькими агентами.
 
+Паспорт ведётся автоматически: `chat.message` создаёт draft, `file.edited`
+добавляет файл, `session.idle` делает auto-seal. Сканирование diff-aware:
+для tracked-файлов проверяется только `git diff` относительно `base_ref`
+(по умолчанию `HEAD`), новые файлы сканируются целиком.
+
+## 6.2. Tool trust registry
+
+`tool_trust` пиннит fingerprint инструмента (имя + описание + JSON-схема).
+V2-адаптер при старте перечисляет `editor.list()` и синхронизирует записи;
+несовпадение fingerprint переводит инструмент в `changed` — это сигнал
+rug pull (MCP-сервер подменил описание или схему после подключения).
+Эвристики prompt injection (`ignore previous instructions`, эксфильтрация,
+скрытые инструкции) дают `suspicious`. Политика `toolTrustPolicy`
+(`warn`/`block`) определяет, пишет observer предупреждение или отклоняет вызов.
+
 ## 7. Хранение
 
-- 21 таблица + FTS5-таблица `knowledge_nodes_fts`; миграции 001–013, версия в
+- 22 таблицы + FTS5-таблица `knowledge_nodes_fts`; миграции 001–014, версия в
   `schema_version`.
 - Batch-очередь: `batchSize` (default 10), flush каждые 5 с; при ошибке batch
   выполняется построчная запись, «отравленные» строки логируются, очередь не
@@ -201,7 +218,7 @@ review Markdown.
 `src/v2.ts` — единственная точка входа V2 (`exports["."]`). Он поднимает то же
 ядро, что и `src/index.ts`, и переводит V2 API в V1-контракты.
 
-- **Tools**: `ctx.tool.transform` регистрирует 17 инструментов с
+- **Tools**: `ctx.tool.transform` регистрирует 18 инструментов с
   `codemode: false`; `ctx.tool.hook("execute.before"/"execute.after")` вызывает
   V1-guardrails, `ctx.session.hook("prompt")` — auto-task, `ctx.session.hook("compaction")`
   — briefing, `ctx.permission.hook("evaluate")` — hard deny Change Contract.

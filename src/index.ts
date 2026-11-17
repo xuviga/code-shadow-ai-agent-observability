@@ -18,6 +18,8 @@ import { createContextTool } from "./tools/context.js"
 import { createDecideTool } from "./tools/decide.js"
 import { createAgentTools } from "./tools/agent.js"
 import { createPassportTool } from "./tools/passport.js"
+import { createToolTrustTool } from "./tools/trust.js"
+import { syncToolTrustBatch } from "./tool-trust.js"
 import { createLogger } from "./logger.js"
 
 // ---------------------------------------------------------------------------
@@ -243,6 +245,8 @@ ${lastSession ? `- **Последняя сессия**: ${lastSession.agent_type
 7. **После проверки** → evidence создаётся автоматически для test/typecheck/build/lint/check команд
 8. **Перед завершением** → code_shadow_passport action="seal", затем code_shadow_task action="done_check", затем action="complete"
 8a. **Если паспорт blocked** → устрани findings/контракты/claims и повтори seal; не объявляй успех
+8b. **Файл занят другой сессией** → code_shadow_passport action="claims"; не обходи конфликт, дождись release
+8c. **Незнакомый или изменившийся инструмент/MCP** → code_shadow_tool_trust action="list" и "verify"; changed/suspicious = возможный rug pull
 9. **При конфликте источников** → code_shadow_contradiction
 10. **Важный факт о проекте** → code_shadow_memory_write
 11. **Каждые 5-10 правок** → code_shadow_analyze query="hotspots"
@@ -271,6 +275,7 @@ ${lastSession ? `- **Последняя сессия**: ${lastSession.agent_type
 | code_shadow_contradiction | Конфликтующие утверждения и их разрешение |
 | code_shadow_provenance | Доверие к файлам/выводу инструментов и injection flags |
 | code_shadow_passport | Proof-Carrying Change: intent, findings, evidence, contracts, claims, hash-chain, review packet |
+| code_shadow_tool_trust | Пиннинг описаний/схем MCP и инструментов, обнаружение rug pull |
 | code_shadow_handoff | Переносимый снимок работы между агентами/сессиями |
 | code_shadow_agent_insight | Поведение агента, качество evidence и риск работы |
 | code_shadow_memory_write | Сохранить важный факт (пути, конфиги, конвенции) |
@@ -424,6 +429,7 @@ export const CodeShadow = async (
     ...createDecideTool(storage, config, log),
     ...createAgentTools(storage, config, log),
     ...createPassportTool(storage, config, log),
+    ...createToolTrustTool(storage, config, log),
   }
 
   log.info(`Загружено тулзов: ${Object.keys(allTools).length}`)
@@ -512,6 +518,14 @@ export const CodeShadow = async (
 
   return {
     ...mergedHooks,
+    syncToolTrust: (projectRoot: string, tools: any[]) => {
+      try {
+        return syncToolTrustBatch(storage, projectRoot, tools)
+      } catch (err) {
+        log.error(`syncToolTrust error: ${String(err)}`)
+        return []
+      }
+    },
     tool: allTools as Record<string, unknown>,
     dispose: async () => cleanup(),
   } as any

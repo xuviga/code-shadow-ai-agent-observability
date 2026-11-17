@@ -27,6 +27,7 @@
 | 011 | `011_knowledge_fts.ts` | FTS5-индекс `knowledge_nodes_fts` + триггеры |
 | 012 | `012_event_taxonomy.ts` | `tool_warning` и `turn_completed`; разделение блокирующих и advisory-событий |
 | 013 | `013_change_passports.ts` | `change_passports` (Proof-Carrying Change) и `file_claims` (multi-agent ownership) |
+| 014 | `014_tool_trust.ts` | `tool_trust` — пиннинг описаний/схем инструментов и MCP, rug-pull detection |
 
 ## 2. Сырая телеметрия
 
@@ -133,6 +134,7 @@ tested_by|implements|extends|coupled_with|references`), `weight`,
 | `agent_handoffs` | `id TEXT PK`, `project_root`, `task_id FK SET NULL`, `session_id`, `summary`, `next_action`, `payload` JSON, timestamps | `open/claimed/completed` |
 | `change_passports` | `id TEXT PK`, `project_root`, `session_id`, `task_id`, `contract_id`, `intent`, `status`, `risk_score/level`, `files`/`evidence_ids`/`checks`/`findings` JSON, `budget_tokens`, `tokens_used`, `allow_destructive`, `agent`, `model`, `base_ref`, `rollback_plan`, `review_md`, `hash`, `prev_hash`, timestamps | `draft/sealed/blocked/superseded` |
 | `file_claims` | `id TEXT PK`, `project_root`, `file_path`, `session_id`, `agent`, `status`, `note`, `created_at`, `expires_at`, `released_at` | `active/released/expired`; partial UNIQUE на active `(project_root,file_path)` |
+| `tool_trust` | `id TEXT PK`, `project_root`, `server_name`, `tool_name`, `fingerprint`, `description_hash`, `schema_hash`, `status`, `first_seen`, `last_seen`, `metadata` JSON | `trusted/changed/blocked/suspicious`; UNIQUE `(project_root,tool_name)` |
 
 Индексы: `(project_root,status,updated_at)` для tasks/contracts,
 `(task_id,position)`, `(project_root,task_id,created_at)` для evidence,

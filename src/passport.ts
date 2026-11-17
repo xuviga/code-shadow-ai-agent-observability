@@ -278,32 +278,65 @@ function maskLiterals(line: string): string {
   return chars.join("")
 }
 
+/** A test file by path, mirroring the convention used by the test runner. */
+function isTestFilePath(filePath: string): boolean {
+  return /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(filePath)
+}
+
+/** An assertion call (`expect(`, `assert(`, `assert.`, `should(`). */
+const ASSERTION_CALL = /\b(?:expect|assert|should)\s*[.(]/
+
+/**
+ * An assertion statement, including Python's `assert value`. Used on diff
+ * lines to notice that a test lost its assertion without gaining a new one.
+ */
+const ASSERTION_STATEMENT = /\bexpect\s*\(|\bassert\b|\bshould\s*\(/
+
+/**
+ * Applies the almost-right rules to a single line. Shared by the full-file
+ * scanner and the diff scanner so both report identical findings.
+ */
+function scanLine(
+  filePath: string,
+  line: string,
+  lineNumber: number,
+  isTestFile: boolean,
+): PassportFinding[] {
+  const masked = maskLiterals(line)
+  const findings: PassportFinding[] = []
+  for (const rule of ALMOST_RIGHT_RULES) {
+    // TODO/FIXME in a test documents missing coverage; in a diff seal it is
+    // only info noise, not a signal about the current change.
+    if (rule.id === "todo-marker" && isTestFile) continue
+    if (!rule.pattern.test(masked)) continue
+    findings.push(finding(rule.id, rule.severity, filePath, lineNumber, rule.message))
+  }
+  return findings
+}
+
 /**
  * Scans one file's current content for "almost right" patterns: code that can
  * look complete while suppressing an error, disabling a test or hiding a
  * destructive operation. Returns one finding per rule/line.
+ *
+ * This is the full-file scanner: use it for new/untracked files. For files that
+ * already exist in git, prefer `scanDiffForAlmostRight` so untouched legacy
+ * code does not produce findings for the current change.
  */
 export function scanAlmostRight(filePath: string, content: string): PassportFinding[] {
   if (!filePath || !content) return []
   if (content.length > MAX_SCAN_BYTES) content = content.slice(0, MAX_SCAN_BYTES)
   const findings: PassportFinding[] = []
-  const seen = new Set<string>()
+  const isTestFile = isTestFilePath(filePath)
   const lines = content.split(/\r?\n/)
 
   for (let index = 0; index < lines.length; index++) {
-    const line = maskLiterals(lines[index])
-    for (const rule of ALMOST_RIGHT_RULES) {
-      if (!rule.pattern.test(line)) continue
-      const key = `${rule.id}:${index + 1}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      findings.push(finding(rule.id, rule.severity, filePath, index + 1, rule.message))
-    }
+    findings.push(...scanLine(filePath, lines[index], index + 1, isTestFile))
   }
 
   // A test file without assertions is usually a false proof of verification.
-  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(filePath)) {
-    const hasAssertion = /\b(?:expect|assert|should)\s*[.(]/.test(content)
+  if (isTestFile) {
+    const hasAssertion = ASSERTION_CALL.test(content)
     if (!hasAssertion) {
       findings.push(
         finding(
@@ -320,10 +353,98 @@ export function scanAlmostRight(filePath: string, content: string): PassportFind
   return findings
 }
 
+const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/
+
+/**
+ * Scans only the added lines of a unified diff (`git diff --unified=0`).
+ * Findings point at new-file line numbers, so they line up with the current
+ * content of `filePath`. Removed assertions are reported when a diff drops an
+ * `expect(`/`assert`/`should(` line without adding another assertion.
+ */
+export function scanDiffForAlmostRight(diffText: string, filePath: string): PassportFinding[] {
+  if (!diffText || !filePath) return []
+  const findings: PassportFinding[] = []
+  const seen = new Set<string>()
+  const isTestFile = isTestFilePath(filePath)
+  let inHunk = false
+  let newLine = 0
+  let hunkNewLine = 0
+  let removedAssertionLine: number | null = null
+  let addedAssertion = false
+
+  const push = (items: PassportFinding[]): void => {
+    for (const item of items) {
+      const key = `${item.kind}:${item.line}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      findings.push(item)
+    }
+  }
+
+  for (const raw of diffText.split(/\r?\n/)) {
+    const hunk = HUNK_HEADER.exec(raw)
+    if (hunk) {
+      hunkNewLine = Number(hunk[1])
+      newLine = hunkNewLine
+      inHunk = true
+      continue
+    }
+    if (!inHunk) {
+      // File headers (`diff --git`, `index`, `---`, `+++`, modes, rename
+      // metadata, `Binary files ... differ`) are ignored outside hunks.
+      continue
+    }
+
+    if (raw.startsWith("diff --git ")) {
+      inHunk = false
+      continue
+    }
+    if (raw.startsWith("\\")) continue // "\ No newline at end of file"
+
+    if (raw.startsWith("+")) {
+      const line = raw.slice(1)
+      push(scanLine(filePath, line, newLine, isTestFile))
+      if (ASSERTION_STATEMENT.test(line)) addedAssertion = true
+      newLine++
+      continue
+    }
+    if (raw.startsWith("-")) {
+      if (removedAssertionLine === null && ASSERTION_STATEMENT.test(raw.slice(1))) {
+        removedAssertionLine = hunkNewLine
+      }
+      continue
+    }
+    // Context lines (leading space) and, defensively, an empty line that lost
+    // its leading space: both exist in the new file.
+    newLine++
+  }
+
+  if (removedAssertionLine !== null && !addedAssertion) {
+    findings.push(
+      finding(
+        "test-assertion-removed",
+        "warning",
+        filePath,
+        removedAssertionLine,
+        "Удалён expect/assert без замены — тест перестал доказывать поведение",
+      ),
+    )
+  }
+
+  return findings
+}
+
 /**
  * Classifies a shell command before execution. Critical findings are intended
  * to be blocked unless a passport explicitly allows destructive actions.
  */
+const SHELL_TOOL_PATTERN = /^(bash|shell|exec|execute|command|run|terminal|powershell|pwsh|cmd)$/i
+
+/** Only shell-like tools can execute a command; edit/write args may contain command text. */
+export function isShellLikeTool(toolName: string): boolean {
+  return SHELL_TOOL_PATTERN.test((toolName || "").trim())
+}
+
 export function isInspectionCommand(command: string): boolean {
   const tokens = (command || "").trim().split(/\s+/)
   const executable = (tokens[0] || "").replace(/^["']|["']$/g, "").toLowerCase()

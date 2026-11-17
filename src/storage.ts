@@ -40,6 +40,8 @@ import type {
   AgentHandoff,
   ChangePassport,
   FileClaim,
+  ToolTrustRecord,
+  ToolTrustStatus,
   PassportCheck,
   PassportFile,
   PassportFinding,
@@ -59,6 +61,7 @@ import { migrateV010KnowledgeNodeNaturalKey } from "./migrations/010_knowledge_n
 import { migrateV011KnowledgeFts } from "./migrations/011_knowledge_fts";
 import { migrateV012EventTaxonomy } from "./migrations/012_event_taxonomy";
 import { migrateV013ChangePassports } from "./migrations/013_change_passports";
+import { migrateV014ToolTrust } from "./migrations/014_tool_trust";
 import { pathMatches } from "./path-match";
 
 // ---------------------------------------------------------------------------
@@ -468,6 +471,7 @@ export class StorageEngine {
       { version: 11, description: "011 (FTS5-индекс памяти)", run: migrateV011KnowledgeFts },
       { version: 12, description: "012 (tool_warning/turn_completed)", run: migrateV012EventTaxonomy },
       { version: 13, description: "013 (change passports и file claims)", run: migrateV013ChangePassports },
+      { version: 14, description: "014 (tool trust fingerprints)", run: migrateV014ToolTrust },
     ];
 
     log.debug(`Текущая версия схемы: ${this.readSchemaVersion()}`);
@@ -997,6 +1001,16 @@ export class StorageEngine {
       sessionId: row.session_id, agent: row.agent, status: row.status,
       note: row.note, createdAt: row.created_at, expiresAt: row.expires_at,
       releasedAt: row.released_at,
+    }
+  }
+
+  private toolTrustRow(row: Record<string, any>): ToolTrustRecord {
+    return {
+      id: row.id, projectRoot: row.project_root, serverName: row.server_name,
+      toolName: row.tool_name, fingerprint: row.fingerprint,
+      descriptionHash: row.description_hash, schemaHash: row.schema_hash,
+      status: row.status, firstSeen: row.first_seen, lastSeen: row.last_seen,
+      metadata: this.parseJson<Record<string, unknown> | null>(row.metadata, null),
     }
   }
 
@@ -1607,6 +1621,126 @@ export class StorageEngine {
       toolName: row.tool_name, argsPreview: row.args_preview,
       status: row.status, timestamp: row.timestamp,
     }))
+  }
+
+  /**
+   * Latest evidence of activity for a session. Used to decide whether a file
+   * claim belongs to a live agent or to a finished/stale session that should
+   * not block other agents.
+   */
+  getSessionLastActivityAt(sessionId: string): number | null {
+    const row = this.getDb().prepare(
+      `SELECT MAX(ts) AS ts FROM (
+         SELECT MAX(timestamp) AS ts FROM tool_executions WHERE session_id = ?1
+         UNION ALL SELECT MAX(timestamp) AS ts FROM file_edits WHERE session_id = ?1
+         UNION ALL SELECT MAX(timestamp) AS ts FROM developer_events WHERE session_id = ?1
+         UNION ALL SELECT COALESCE(ended_at, started_at) AS ts FROM sessions WHERE id = ?1
+       )`,
+    ).get(sessionId) as { ts: number | null } | undefined
+    return row?.ts ?? null
+  }
+
+  // =========================================================================
+  // Tool trust: pinned descriptions/schemas and rug-pull detection
+  // =========================================================================
+
+  getToolTrust(projectRoot: string, toolName: string): ToolTrustRecord | undefined {
+    const row = this.getDb().prepare(
+      `SELECT * FROM tool_trust WHERE project_root = ?1 AND tool_name = ?2`,
+    ).get(projectRoot, toolName) as Record<string, any> | undefined
+    return row ? this.toolTrustRow(row) : undefined
+  }
+
+  listToolTrust(projectRoot: string, status?: ToolTrustStatus, limit = 100): ToolTrustRecord[] {
+    const db = this.getDb()
+    const rows = status
+      ? db.prepare(
+          `SELECT * FROM tool_trust WHERE project_root = ?1 AND status = ?2
+           ORDER BY last_seen DESC, tool_name ASC LIMIT ?3`,
+        ).all(projectRoot, status, limit)
+      : db.prepare(
+          `SELECT * FROM tool_trust WHERE project_root = ?1
+           ORDER BY last_seen DESC, tool_name ASC LIMIT ?2`,
+        ).all(projectRoot, limit)
+    return (rows as Record<string, any>[]).map((row) => this.toolTrustRow(row))
+  }
+
+  /**
+   * Pins a tool fingerprint. A first sighting is trusted; an identical
+   * fingerprint only refreshes last_seen; a different fingerprint replaces the
+   * pinned description/schema hashes and marks the tool as changed.
+   */
+  upsertToolTrust(input: {
+    projectRoot: string
+    serverName?: string | null
+    toolName: string
+    fingerprint: string
+    descriptionHash?: string | null
+    schemaHash?: string | null
+    metadata?: Record<string, unknown> | null
+  }): { record: ToolTrustRecord; changed: boolean; previousStatus: ToolTrustStatus | null } {
+    const db = this.getDb()
+    const now = Date.now()
+    const existing = this.getToolTrust(input.projectRoot, input.toolName)
+
+    if (!existing) {
+      const id = crypto.randomUUID()
+      db.prepare(`INSERT INTO tool_trust
+        (id, project_root, server_name, tool_name, fingerprint, description_hash,
+         schema_hash, status, first_seen, last_seen, metadata)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,'trusted',?8,?8,?9)`).run(
+        id, input.projectRoot, input.serverName ?? null, input.toolName,
+        input.fingerprint, input.descriptionHash ?? null, input.schemaHash ?? null,
+        now, this.json(input.metadata ?? null),
+      )
+      return { record: this.getToolTrust(input.projectRoot, input.toolName)!, changed: false, previousStatus: null }
+    }
+
+    if (existing.fingerprint === input.fingerprint) {
+      db.prepare(
+        `UPDATE tool_trust SET last_seen = ?1, server_name = ?2 WHERE id = ?3`,
+      ).run(now, input.serverName ?? existing.serverName, existing.id)
+      return {
+        record: this.getToolTrust(input.projectRoot, input.toolName)!,
+        changed: false,
+        previousStatus: existing.status,
+      }
+    }
+
+    db.prepare(`UPDATE tool_trust
+      SET server_name = ?1, fingerprint = ?2, description_hash = ?3,
+          schema_hash = ?4, status = 'changed', last_seen = ?5, metadata = ?6
+      WHERE id = ?7`).run(
+      input.serverName ?? existing.serverName, input.fingerprint,
+      input.descriptionHash ?? null, input.schemaHash ?? null, now,
+      this.json(input.metadata ?? null), existing.id,
+    )
+    return {
+      record: this.getToolTrust(input.projectRoot, input.toolName)!,
+      changed: true,
+      previousStatus: existing.status,
+    }
+  }
+
+  setToolTrustStatus(
+    projectRoot: string,
+    toolName: string,
+    status: ToolTrustStatus,
+  ): ToolTrustRecord | undefined {
+    const result = this.getDb().prepare(
+      `UPDATE tool_trust SET status = ?1 WHERE project_root = ?2 AND tool_name = ?3`,
+    ).run(status, projectRoot, toolName)
+    if (Number(result.changes) === 0) return undefined
+    return this.getToolTrust(projectRoot, toolName)
+  }
+
+  /** Releases every active file claim held by one session. */
+  releaseSessionClaims(sessionId: string): number {
+    const result = this.getDb().prepare(
+      `UPDATE file_claims SET status = 'released', released_at = ?1
+       WHERE session_id = ?2 AND status = 'active'`,
+    ).run(Date.now(), sessionId)
+    return Number(result.changes)
   }
 
   // =========================================================================

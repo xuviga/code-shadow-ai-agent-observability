@@ -1,6 +1,6 @@
 # API инструментов Code Shadow
 
-> Актуально на v0.5.3 (17.11.2026). 17 инструментов;
+> Актуально на v0.5.3 (17.11.2026). 18 инструментов;
 > исполняемый источник — `src/tools/*.ts`. Все инструменты возвращают
 > `{ output: string }`; в норме `output` — JSON, но `analyze`,
 > `memory_write` и `memory_note` при внутренней ошибке могут вернуть plain
@@ -102,11 +102,40 @@ failures/contradictions, разрушительные shell-команды, file
 - `open` требует `intent`; `files` и `budget_tokens` опциональны.
 - `seal` собирает доказательства, блокирует при отсутствии verified evidence,
   нарушениях контракта, конфликтах claims или critical/error findings.
+- Для файлов под git сканируется только `git diff --unified=0 <base_ref|HEAD>`:
+  legacy-паттерны в неизменённых строках не создают шум. Новые/untracked файлы
+  сканируются целиком. Удаление `expect(`/`assert` без добавления новой
+  проверки даёт `test-assertion-removed`.
 - `verify` пересчитывает hash и сверяет хеши файлов с диском; изменение файла
   после seal делает паспорт `stale`.
 - `claim/release/claims` — координация нескольких агентов по файлам.
 - `export` пишет `.md`/`.json` в `~/.config/opencode/shadow/passports/`.
 - Если у задачи есть паспорт, Definition of Done требует `status=sealed`.
+
+Паспорт создаётся автоматически на каждый actionable-ход: `chat.message`
+открывает draft, `file.edited` добавляет файлы, `session.idle` выполняет
+auto-seal. Файлы, которые правит сессия, автоматически закрепляются за ней
+(`file_claims`, TTL 30 минут); `session.idle` освобождает claims. Конфликт
+с живой сессией блокирует правку (`fileClaimPolicy: block`), брошенный claim
+неактивной сессии перехватывается автоматически через `fileClaimStaleMs`
+(по умолчанию 5 минут).
+
+## Tool trust (1)
+
+### `code_shadow_tool_trust`
+Actions: `list | get | trust | block | scan | verify`.
+
+Пиннинг MCP/инструментов: fingerprint = SHA-256 от имени, описания и схемы
+аргументов. V2 при старте сканирует `editor.list()` и записывает `tool_trust`;
+изменение описания или схемы после пиннинга помечает инструмент `changed`
+(rug pull), эвристики prompt injection — `suspicious`.
+
+- `scan` принимает `tools_json` — массив `{name, server?, description?, input_schema?}`.
+- `verify` пересчитывает fingerprint и сравнивает с записанным, не меняя статус.
+- `trust`/`block` — явное решение человека.
+- `toolTrustPolicy: warn | block` управляет observer: `warn` пишет
+  `tool_warning`, `block` отклоняет вызов инструмента со статусом
+  `changed`/`suspicious`/`blocked`.
 
 ## Task Graph и governance (10)
 

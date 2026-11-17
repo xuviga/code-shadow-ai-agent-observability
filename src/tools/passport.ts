@@ -6,8 +6,9 @@
 // file claims, token budget, hash-chain and a human review packet.
 // =============================================================================
 
+import { execFileSync } from "node:child_process"
 import * as fs from "node:fs"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { tool } from "@opencode-ai/plugin"
 import type { StorageEngine } from "../storage"
 import type {
@@ -26,8 +27,10 @@ import {
   computePassportHash,
   fileContentHash,
   isScannableFile,
+  isShellLikeTool,
   riskFromFindings,
   scanAlmostRight,
+  scanDiffForAlmostRight,
 } from "../passport"
 
 type ToolContext = Record<string, unknown>
@@ -74,6 +77,45 @@ function readFile(projectRoot: string, filePath: string): { absolute: string; co
     const stat = fs.statSync(absolute)
     if (!stat.isFile() || stat.size > 512 * 1024) return null
     return { absolute, content: fs.readFileSync(absolute, "utf8") }
+  } catch {
+    return null
+  }
+}
+
+type GitDiffResult = { diff: string; tracked: boolean }
+
+/**
+ * Reads the working-tree diff of one file against a base ref. Returns null when
+ * git is unavailable or the command fails (e.g. the project is not a repo), so
+ * the caller can fall back to a full-file scan.
+ */
+export function gitDiff(
+  projectRoot: string,
+  absoluteFile: string,
+  baseRef: string | null,
+): GitDiffResult | null {
+  const relativePath = relative(projectRoot, absoluteFile).replace(/\\/g, "/")
+  if (!relativePath || relativePath.startsWith("../") || relativePath === "..") return null
+  // A ref starting with "-" would be parsed as a git option; use HEAD instead.
+  const base = baseRef && !baseRef.startsWith("-") ? baseRef : "HEAD"
+  const git = (args: string[]): string =>
+    execFileSync("git", ["-C", projectRoot, ...args], {
+      encoding: "utf8",
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    })
+  try {
+    const diff = git(["diff", "--unified=0", base, "--", relativePath])
+    let tracked = false
+    try {
+      git(["ls-files", "--error-unmatch", "--", relativePath])
+      tracked = true
+    } catch {
+      tracked = false
+    }
+    return { diff, tracked }
   } catch {
     return null
   }
@@ -160,7 +202,17 @@ export function sealPassport(
     const hash = fileContentHash(loaded.content)
     hashedFiles.push({ ...file, path: normalizeProjectPath(passport.projectRoot, file.path), hash })
     if (isScannableFile(file.path)) {
-      findings.push(...scanAlmostRight(file.path, loaded.content))
+      // Tracked files are scanned only on added lines, so pre-existing legacy
+      // patterns in untouched code do not block (or add noise to) this seal.
+      const change = gitDiff(passport.projectRoot, loaded.absolute, passport.baseRef)
+      if (change?.tracked) {
+        if (change.diff.trim()) {
+          findings.push(...scanDiffForAlmostRight(change.diff, file.path))
+        }
+      } else {
+        // Untracked/new files (or no git) have no diff to inspect: scan all.
+        findings.push(...scanAlmostRight(file.path, loaded.content))
+      }
     }
   }
 
@@ -237,6 +289,9 @@ export function sealPassport(
     const destructive = new Map<string, PassportFinding>()
     for (const preview of previews) {
       if (!preview.argsPreview) continue
+      // Only shell-like tools execute commands; an edit/write arg may contain
+      // command text as a string (a test fixture, a doc, a scanner rule).
+      if (!isShellLikeTool(preview.toolName)) continue
       let command = preview.argsPreview
       try {
         const parsed = JSON.parse(preview.argsPreview) as Record<string, unknown>

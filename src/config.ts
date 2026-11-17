@@ -25,6 +25,9 @@ export const DEFAULT_CONFIG: ShadowConfig = {
   maxArgsPreviewChars: 200,
   disabledEventTypes: [],
   destructiveActionPolicy: "block",
+  toolTrustPolicy: "warn",
+  fileClaimPolicy: "block",
+  fileClaimStaleMs: 5 * 60 * 1000,
   secretPatterns: [
     // .env файлы
     "(?:^|\\W)DB_(?:PASSWORD|USER|NAME|HOST|PORT|URL)\\s*=\\s*\\S+",
@@ -155,6 +158,12 @@ export function loadConfig(
     secretPatterns: userConfig.secretPatterns ?? DEFAULT_CONFIG.secretPatterns,
     destructiveActionPolicy:
       userConfig.destructiveActionPolicy ?? DEFAULT_CONFIG.destructiveActionPolicy,
+    toolTrustPolicy:
+      userConfig.toolTrustPolicy ?? DEFAULT_CONFIG.toolTrustPolicy,
+    fileClaimPolicy:
+      userConfig.fileClaimPolicy ?? DEFAULT_CONFIG.fileClaimPolicy,
+    fileClaimStaleMs:
+      userConfig.fileClaimStaleMs ?? DEFAULT_CONFIG.fileClaimStaleMs,
   };
 
   return merged;
@@ -193,6 +202,12 @@ function normalizeUserConfig(
     result.secretPatterns = raw.secretPatterns as string[];
   if (raw.destructiveActionPolicy === "block" || raw.destructiveActionPolicy === "warn")
     result.destructiveActionPolicy = raw.destructiveActionPolicy;
+  if (raw.toolTrustPolicy === "warn" || raw.toolTrustPolicy === "block")
+    result.toolTrustPolicy = raw.toolTrustPolicy;
+  if (raw.fileClaimPolicy === "block" || raw.fileClaimPolicy === "warn")
+    result.fileClaimPolicy = raw.fileClaimPolicy;
+  if (typeof raw.fileClaimStaleMs === "number" && raw.fileClaimStaleMs > 0)
+    result.fileClaimStaleMs = raw.fileClaimStaleMs;
 
   return result;
 }

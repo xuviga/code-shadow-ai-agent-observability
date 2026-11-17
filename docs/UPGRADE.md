@@ -63,7 +63,7 @@ It checks:
   `./plugins/code-shadow/tui-plugin.tsx`;
 - the installed `~/.config/opencode/plugins/code-shadow/tui-v2.ts`;
 - the shadow DB at `~/.config/opencode/shadow/data.db`: `schema_version` is at
-  least 13, plus counts for `turn_completed`, `tool_warning`, `tool_rejected`,
+  least 14, plus counts for `turn_completed`, `tool_warning`, `tool_rejected`,
   blocking `tool_rejected`, `file_edits`, and `tool_executions` over the last
   24 hours.
 
@@ -81,7 +81,7 @@ After the reload, inspect `~/.local/share/opencode/log/code-shadow-v2.log`:
 
 - `registered <hook>` lines for each guard hook;
 - `v2 event subscription (14)`;
-- `v2 registry (17)`;
+- `v2 registry (18)`;
 - no repeated event-translation errors or stack traces.
 
 If the sidebar is missing, also check
@@ -99,7 +99,7 @@ entry was introduced. The `./v1` entry keeps the OpenCode 1 hook API.
 ## Database
 
 Migrations run automatically when the plugin starts. The doctor only reads
-`MAX(version)` from `schema_version`. If it reports a version below 13, start
-OpenCode once so migrations 013 and later are applied, then rerun
+`MAX(version)` from `schema_version`. If it reports a version below 14, start
+OpenCode once so migrations 014 and later are applied, then rerun
 `npm run doctor`. Do not open the database read-write while OpenCode is
 running; the doctor already opens it read-only.
