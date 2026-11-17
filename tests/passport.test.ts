@@ -37,8 +37,9 @@ function createFixture() {
   const project = join(directory, "project")
   mkdirSync(join(project, "src"), { recursive: true })
   writeFileSync(join(project, "src", "a.ts"), "export const value = 1\n", "utf8")
-  const storage = new StorageEngine({ ...config, dbPath: join(directory, "data.db") })
-  const tool = createPassportTool(storage, config as never, {
+  const storageConfig = { ...config, dbPath: join(directory, "data.db") }
+  const storage = new StorageEngine(storageConfig as never)
+  const tool = createPassportTool(storage, storageConfig as never, {
     debug: () => {}, info: () => {}, warn: () => {}, error: () => {},
   } as never)
   fixtures.push({ storage, directory, project })

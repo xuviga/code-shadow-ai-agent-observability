@@ -5,3 +5,6 @@ dist/
 bun.lock
 .opencode/
 .squad/
+# Local signing material must never be committed.
+keys/
+*.pem

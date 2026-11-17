@@ -491,6 +491,13 @@ export interface ChangePassport {
   reviewMd: string | null;
   hash: string | null;
   prevHash: string | null;
+  /** DSSE envelope (in-toto Statement + Ed25519 signature), JSON. */
+  attestation: string | null;
+  keyId: string | null;
+  signature: string | null;
+  publicKey: string | null;
+  statementDigest: string | null;
+  signedAt: number | null;
   createdAt: number;
   updatedAt: number;
   sealedAt: number | null;
@@ -746,6 +753,12 @@ export interface ShadowConfig {
   toolTrustPolicy?: "warn" | "block";
   fileClaimPolicy?: "block" | "warn";
   fileClaimStaleMs?: number;
+  /** Каталог для локального Ed25519-ключа подписи паспортов. */
+  signingKeyDir?: string;
+  /** Явный путь к PEM-ключу (переопределяет signingKeyDir). */
+  signingKeyPath?: string;
+  /** Требовать подпись паспорта: require (default), warn или off. */
+  passportSignaturePolicy?: "require" | "warn" | "off";
 }
 
 /** Элемент очереди пакетной записи */

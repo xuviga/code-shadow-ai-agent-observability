@@ -22,6 +22,16 @@ import { resolvePath, sanitizeContent } from "../config"
 import { createLogger } from "../logger"
 import { normalizeProjectPath } from "../project-path"
 import {
+  buildPassportStatement,
+  defaultKeyDir,
+  loadOrCreateSigningKey,
+  signStatement,
+  statementDigest,
+  verifyEnvelope,
+  type DsseEnvelope,
+  type SigningKey,
+} from "../attestation"
+import {
   buildReviewMarkdown,
   classifyDestructiveCommand,
   computePassportHash,
@@ -468,6 +478,32 @@ export function sealPassport(
     `${suspiciousSources.length} подозрительных`,
   )
 
+  // Signature is part of the sealed state: an unsigned passport is not a proof.
+  const signaturePolicy = config.passportSignaturePolicy ?? "require"
+  let signingKey: SigningKey | null = null
+  let signingError: string | null = null
+  if (signaturePolicy !== "off") {
+    try {
+      signingKey = loadOrCreateSigningKey({
+        keyDir: config.signingKeyDir || defaultKeyDir(config.dbPath),
+        keyPath: config.signingKeyPath,
+      })
+    } catch (error) {
+      signingError = String(error)
+    }
+  }
+  check(
+    checks,
+    "passport-signed",
+    "Паспорт подписан Ed25519 (DSSE/in-toto)",
+    signingKey ? "pass" : signaturePolicy === "require" ? "fail" : "warn",
+    signingKey
+      ? `keyid ${signingKey.keyId}`
+      : signaturePolicy === "off"
+        ? "подпись отключена конфигурацией"
+        : (signingError ?? "ключ подписи недоступен"),
+  )
+
   const blocked = checks.some((item) => item.status === "fail")
   const status: ChangePassport["status"] = blocked ? "blocked" : "sealed"
   const prevHash = passport.hash ? passport.prevHash : storage.getLastPassportHash(passport.projectRoot)
@@ -486,12 +522,48 @@ export function sealPassport(
     sealedAt,
     hash: null,
     reviewMd: null,
+    attestation: null,
+    keyId: null,
+    signature: null,
+    publicKey: null,
+    statementDigest: null,
+    signedAt: null,
     updatedAt: sealedAt,
   }
   draft.reviewMd = buildReviewMarkdown(draft)
   draft.hash = computePassportHash(draft)
   // The hash excludes reviewMd, so the packet can include the final hash.
   draft.reviewMd = buildReviewMarkdown(draft)
+
+  // Sign only after the verdict is final: the statement covers checks, findings
+  // and the passport hash, but not the signature itself.
+  if (signingKey) {
+    try {
+      const statement = buildPassportStatement(draft, { generator: "opencode-code-shadow" })
+      const envelope = signStatement(statement, signingKey)
+      draft.attestation = JSON.stringify(envelope)
+      draft.keyId = signingKey.keyId
+      draft.signature = envelope.signatures[0]?.sig ?? null
+      draft.publicKey = signingKey.publicPem
+      draft.statementDigest = statementDigest(statement)
+      draft.signedAt = envelope["x-code-shadow-signed-at"] ?? Date.now()
+      draft.reviewMd = buildReviewMarkdown(draft)
+    } catch (error) {
+      const index = checks.findIndex((item) => item.id === "passport-signed")
+      if (index >= 0) {
+        checks[index] = {
+          ...checks[index],
+          status: "fail",
+          details: `ошибка подписи: ${String(error)}`,
+        }
+      }
+      draft.checks = checks
+      draft.status = checks.some((item) => item.status === "fail") ? "blocked" : "sealed"
+      draft.hash = computePassportHash(draft)
+      draft.reviewMd = buildReviewMarkdown(draft)
+      log.error(`Passport ${passport.id} signing failed: ${String(error)}`)
+    }
+  }
   const saved = storage.updatePassport(passport.id, {
     status: draft.status,
     riskScore: draft.riskScore,
@@ -505,6 +577,12 @@ export function sealPassport(
     sealedAt: draft.sealedAt,
     reviewMd: draft.reviewMd,
     hash: draft.hash,
+    attestation: draft.attestation,
+    keyId: draft.keyId,
+    signature: draft.signature,
+    publicKey: draft.publicKey,
+    statementDigest: draft.statementDigest,
+    signedAt: draft.signedAt,
   })
   log.info(`Passport ${passport.id} ${status}: risk=${risk.score} (${risk.level}), findings=${findings.length}`)
   return saved ?? draft
@@ -520,12 +598,13 @@ export function createPassportTool(
   return {
     code_shadow_passport: tool({
       description:
-        "Proof-Carrying Change: создаёт и запечатывает паспорт изменения с intent, файлами, almost-right findings, Change Contract, verified evidence, destructive-командами, file claims, бюджетом, hash-chain и готовым review packet. Используй перед завершением задачи.",
+        "Proof-Carrying Change: создаёт и запечатывает паспорт изменения с intent, файлами, almost-right findings, Change Contract, verified evidence, destructive-командами, file claims, бюджетом, hash-chain, Ed25519-подписью (DSSE/in-toto) и готовым review packet. Используй перед завершением задачи.",
       args: {
         action: tool.schema.enum([
           "open",
           "add",
           "seal",
+          "attest",
           "get",
           "list",
           "review",
@@ -609,7 +688,13 @@ export function createPassportTool(
             const existing = storage.getLatestPassport(root, sessionId ?? undefined, taskId ?? undefined)
             if (existing && existing.status === "draft") {
               const files = uniqueFiles(root, existing.files, args.files)
-              const updated = storage.updatePassport(existing.id, { files })
+              const patch: Record<string, unknown> = { files }
+              // An auto-created draft carries the raw user message; an explicit
+              // intent from the agent is more precise and must win.
+              if (args.intent?.trim() && args.intent.trim() !== existing.intent) {
+                patch.intent = sanitizeContent(args.intent, config.secretPatterns)
+              }
+              const updated = storage.updatePassport(existing.id, patch as never)
               return jsonOutput({ passport: updated, reused: true })
             }
             const passport = storage.createPassport({
@@ -736,15 +821,110 @@ export function createPassportTool(
             }))
             const hashValid = Boolean(currentHash && recomputed === currentHash)
             const filesValid = fileChecks.every((item) => item.valid)
-            const evidenceValid = evidenceChecks.every((item) => item.status === "verified")
+            // verify() is about provenance integrity: evidence must still exist.
+            // Quality of each evidence record was already judged at seal time.
+            const evidenceMissing = evidenceChecks.filter((item) => item.status === "missing").length
+            const evidenceValid = evidenceMissing === 0
+            const evidenceUnverified = evidenceChecks.filter(
+              (item) => item.status !== "verified",
+            ).length
+
+            let envelope: DsseEnvelope | null = null
+            try {
+              envelope = passport.attestation
+                ? (JSON.parse(passport.attestation) as DsseEnvelope)
+                : null
+            } catch {
+              envelope = null
+            }
+            const verified = envelope
+              ? verifyEnvelope(envelope)
+              : { valid: false, keyId: null, signedAt: null, statement: null, error: "passport is not signed" }
+            const statementDigestMatches = Boolean(
+              verified.statement &&
+                passport.statementDigest &&
+                statementDigest(verified.statement) === passport.statementDigest,
+            )
+            const signatureValid = Boolean(verified.valid && statementDigestMatches)
+            const signaturePolicy = config.passportSignaturePolicy ?? "require"
+            const signatureOk =
+              signatureValid || (signaturePolicy !== "require" && !passport.attestation)
+
+            const problems: string[] = []
+            if (!hashValid) problems.push("passport_hash_mismatch")
+            if (!signatureOk) problems.push(passport.attestation ? "signature_invalid" : "unsigned")
+            if (!filesValid) problems.push("files_changed")
+            if (!evidenceValid) problems.push("evidence_missing")
+
+            const status =
+              !hashValid || (passport.attestation && !signatureValid)
+                ? "tampered"
+                : !signatureOk
+                  ? "unsigned"
+                  : filesValid && evidenceValid
+                    ? "valid"
+                    : "stale"
+
             return jsonOutput({
               passport_id: passport.id,
-              status: hashValid && filesValid && evidenceValid ? "valid" : "stale",
+              status,
               hash_valid: hashValid,
               files_valid: filesValid,
               evidence_valid: evidenceValid,
+              evidence_unverified: evidenceUnverified,
+              problems,
+              signature: {
+                present: Boolean(passport.attestation),
+                valid: signatureValid,
+                key_id: passport.keyId,
+                signed_at: passport.signedAt,
+                statement_digest: passport.statementDigest,
+                statement_digest_matches: statementDigestMatches,
+                subject_count: verified.statement?.subject.length ?? 0,
+                error: verified.error,
+              },
               files: fileChecks,
               evidence: evidenceChecks,
+            })
+          }
+
+          if (args.action === "attest") {
+            const policy = config.passportSignaturePolicy ?? "require"
+            if (policy === "off") {
+              return jsonOutput({ error: "подпись отключена: passportSignaturePolicy=off" })
+            }
+            let key: SigningKey
+            try {
+              key = loadOrCreateSigningKey({
+                keyDir: config.signingKeyDir || defaultKeyDir(config.dbPath),
+                keyPath: config.signingKeyPath,
+              })
+            } catch (error) {
+              return jsonOutput({ error: `ключ подписи недоступен: ${String(error)}` })
+            }
+            const statement = buildPassportStatement(passport, {
+              generator: "opencode-code-shadow",
+            })
+            const envelope = signStatement(statement, key)
+            const updated = storage.updatePassport(passport.id, {
+              attestation: JSON.stringify(envelope),
+              keyId: key.keyId,
+              signature: envelope.signatures[0]?.sig ?? null,
+              publicKey: key.publicPem,
+              statementDigest: statementDigest(statement),
+              signedAt: envelope["x-code-shadow-signed-at"] ?? Date.now(),
+              reviewMd: buildReviewMarkdown({
+                ...passport,
+                keyId: key.keyId,
+                signedAt: envelope["x-code-shadow-signed-at"] ?? Date.now(),
+              }),
+            })
+            return jsonOutput({
+              passport_id: passport.id,
+              key_id: key.keyId,
+              statement_digest: statementDigest(statement),
+              envelope,
+              passport: updated,
             })
           }
 
@@ -755,9 +935,18 @@ export function createPassportTool(
             const review = passport.reviewMd || buildReviewMarkdown(passport)
             fs.writeFileSync(`${base}.md`, review, "utf8")
             fs.writeFileSync(`${base}.json`, JSON.stringify(passport, null, 2), "utf8")
-            return jsonOutput({
-              exported: { markdown: `${base}.md`, json: `${base}.json` },
-            })
+            const exported: Record<string, string> = {
+              markdown: `${base}.md`,
+              json: `${base}.json`,
+            }
+            if (passport.attestation) {
+              // Portable DSSE envelope plus an in-toto bundle-style JSONL line.
+              fs.writeFileSync(`${base}.att.json`, passport.attestation, "utf8")
+              fs.writeFileSync(`${base}.intoto.jsonl`, `${passport.attestation}\n`, "utf8")
+              exported.attestation = `${base}.att.json`
+              exported.intotoBundle = `${base}.intoto.jsonl`
+            }
+            return jsonOutput({ exported })
           }
 
           return jsonOutput({ error: `Неизвестное действие: ${args.action}` })

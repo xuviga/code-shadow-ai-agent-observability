@@ -28,6 +28,7 @@
 | 012 | `012_event_taxonomy.ts` | `tool_warning` и `turn_completed`; разделение блокирующих и advisory-событий |
 | 013 | `013_change_passports.ts` | `change_passports` (Proof-Carrying Change) и `file_claims` (multi-agent ownership) |
 | 014 | `014_tool_trust.ts` | `tool_trust` — пиннинг описаний/схем инструментов и MCP, rug-pull detection |
+| 015 | `015_attestation.ts` | DSSE/in-toto attestation: `attestation`, `key_id`, `signature`, `public_key`, `statement_digest`, `signed_at` в `change_passports` |
 
 ## 2. Сырая телеметрия
 
@@ -132,7 +133,7 @@ tested_by|implements|extends|coupled_with|references`), `weight`,
 | `contradiction_records` | `id TEXT PK`, `project_root`, `task_id FK SET NULL`, `claim_a/source_a`, `claim_b/source_b`, `severity`, `resolution`, timestamps | `open/resolved/accepted`; severity `low/medium/high/critical` |
 | `provenance_events` | `id INTEGER PK AI`, `project_root`, `session_id`, `source_type` (`user/system/file/tool_output/memory/external`), `source_ref`, `content_hash`, `trust_level` (`system/user/verified/observed/untrusted`), `flags` JSON, `snippet` | — |
 | `agent_handoffs` | `id TEXT PK`, `project_root`, `task_id FK SET NULL`, `session_id`, `summary`, `next_action`, `payload` JSON, timestamps | `open/claimed/completed` |
-| `change_passports` | `id TEXT PK`, `project_root`, `session_id`, `task_id`, `contract_id`, `intent`, `status`, `risk_score/level`, `files`/`evidence_ids`/`checks`/`findings` JSON, `budget_tokens`, `tokens_used`, `allow_destructive`, `agent`, `model`, `base_ref`, `rollback_plan`, `review_md`, `hash`, `prev_hash`, timestamps | `draft/sealed/blocked/superseded` |
+| `change_passports` | `id TEXT PK`, `project_root`, `session_id`, `task_id`, `contract_id`, `intent`, `status`, `risk_score/level`, `files`/`evidence_ids`/`checks`/`findings` JSON, `budget_tokens`, `tokens_used`, `allow_destructive`, `agent`, `model`, `base_ref`, `rollback_plan`, `review_md`, `hash`, `prev_hash`, `attestation`, `key_id`, `signature`, `public_key`, `statement_digest`, `signed_at`, timestamps | `draft/sealed/blocked/superseded` |
 | `file_claims` | `id TEXT PK`, `project_root`, `file_path`, `session_id`, `agent`, `status`, `note`, `created_at`, `expires_at`, `released_at` | `active/released/expired`; partial UNIQUE на active `(project_root,file_path)` |
 | `tool_trust` | `id TEXT PK`, `project_root`, `server_name`, `tool_name`, `fingerprint`, `description_hash`, `schema_hash`, `status`, `first_seen`, `last_seen`, `metadata` JSON | `trusted/changed/blocked/suspicious`; UNIQUE `(project_root,tool_name)` |
 

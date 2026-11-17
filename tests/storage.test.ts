@@ -51,7 +51,7 @@ describe("StorageEngine", () => {
     const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'todos'").get()
     const errorFileIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_errors_file'").get()
 
-    expect(version.version).toBe(14)
+    expect(version.version).toBe(15)
     expect(table).toBeTruthy()
     expect(errorFileIndex).toBeTruthy()
     const uniqueEdgeIndex = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ke_unique'").get()

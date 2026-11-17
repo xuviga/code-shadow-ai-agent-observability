@@ -91,25 +91,36 @@ title/description; `file_history` — по путям; `analytics` читает 
 ## Proof-Carrying Change (1)
 
 ### `code_shadow_passport`
-Actions: `open | add | seal | get | list | review | verify | export | claim | release | claims`.
+Actions: `open | add | seal | attest | get | list | review | verify | export | claim | release | claims`.
 
 Паспорт изменения — единый проверяемый пакет: intent, файлы и их хеши,
 almost-right findings (пустые catch, отключённые тесты, `|| true`, `as any`,
 SQL DROP/DELETE без WHERE), Change Contract, verified evidence, открытые
 failures/contradictions, разрушительные shell-команды, file claims, бюджет
-токенов, risk-score, hash-chain (`prev_hash`) и готовый review Markdown.
+токенов, risk-score, hash-chain (`prev_hash`), **Ed25519-подпись в DSSE/in-toto
+envelope** и готовый review Markdown.
 
 - `open` требует `intent`; `files` и `budget_tokens` опциональны.
 - `seal` собирает доказательства, блокирует при отсутствии verified evidence,
   нарушениях контракта, конфликтах claims или critical/error findings.
+- `seal` подписывает паспорт локальным Ed25519-ключом и кладёт результат в
+  DSSE-envelope с in-toto Statement (`predicateType`
+  `https://code-shadow.dev/attestation/change-passport/v1`). Политика
+  `passportSignaturePolicy`: `require` (default) → без ключа паспорт `blocked`,
+  `warn` → предупреждение, `off` → подпись не создаётся.
 - Для файлов под git сканируется только `git diff --unified=0 <base_ref|HEAD>`:
   legacy-паттерны в неизменённых строках не создают шум. Новые/untracked файлы
   сканируются целиком. Удаление `expect(`/`assert` без добавления новой
   проверки даёт `test-assertion-removed`.
-- `verify` пересчитывает hash и сверяет хеши файлов с диском; изменение файла
-  после seal делает паспорт `stale`.
+- `verify` пересчитывает hash, проверяет подпись и сверяет хеши файлов с диском.
+  Статусы: `valid`, `stale` (файлы изменились), `tampered` (hash/подпись не
+  сходятся), `unsigned` (политика требует подпись, её нет). Подпись
+  проверяется без плагина: `node scripts/verify-passport.js <file.att.json>`.
+- `attest` переподписывает уже существующий паспорт (ротация ключа, миграция
+  старых записей).
 - `claim/release/claims` — координация нескольких агентов по файлам.
-- `export` пишет `.md`/`.json` в `~/.config/opencode/shadow/passports/`.
+- `export` пишет `.md`, `.json`, а для подписанного паспорта ещё `.att.json`
+  (DSSE) и `.intoto.jsonl` в `~/.config/opencode/shadow/passports/`.
 - Если у задачи есть паспорт, Definition of Done требует `status=sealed`.
 
 Паспорт создаётся автоматически на каждый actionable-ход: `chat.message`

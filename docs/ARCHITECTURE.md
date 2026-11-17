@@ -27,6 +27,7 @@ Code Shadow — локальный плагин OpenCode: постоянная �
 | `src/tools/agent.ts` | Task Graph, Evidence, Failure Memory, Change Contract, Context Router, Counterfactual, Handoff, Insight, Contradiction, Provenance |
 | `src/passport.ts` | Proof-Carrying Change: almost-right scanner, destructive-command classifier, risk, hash-chain, review packet |
 | `src/tools/passport.ts` | `code_shadow_passport` и file claims |
+| `src/attestation.ts` | DSSE PAE, Ed25519-ключи, in-toto Statement, подпись и независимая проверка |
 | `src/tool-trust.ts` | fingerprint описаний/схем инструментов, эвристики prompt injection, batch-синхронизация |
 | `src/tools/trust.ts` | `code_shadow_tool_trust` (list/get/trust/block/scan/verify) |
 | `src/tools/analyze.ts` | `code_shadow_analyze` (9 режимов) |
@@ -156,9 +157,23 @@ rug pull (MCP-сервер подменил описание или схему �
 скрытые инструкции) дают `suspicious`. Политика `toolTrustPolicy`
 (`warn`/`block`) определяет, пишет observer предупреждение или отклоняет вызов.
 
+## 6.3. Passport attestation
+
+Запечатанный паспорт подписывается локальным Ed25519-ключом и упаковывается в
+DSSE-envelope с in-toto Statement внутри (`predicateType`
+`https://code-shadow.dev/attestation/change-passport/v1`). Subject — файлы
+изменения с SHA-256 (пути относительно корня проекта) и, если доступен, git
+commit. Публичный ключ едет внутри конверта, поэтому проверка не требует ни БД,
+ни плагина, ни сети: `node scripts/verify-passport.js <file.att.json>`.
+
+Политика `passportSignaturePolicy`: `require` (default) блокирует паспорт без
+подписи, `warn` только предупреждает, `off` отключает подпись. `hash`/`prevHash`
+отвечают за целостность внутри БД, подпись — за авторство и переносимость.
+Подробности и модель угроз: `docs/ATTESTATION.md`.
+
 ## 7. Хранение
 
-- 22 таблицы + FTS5-таблица `knowledge_nodes_fts`; миграции 001–014, версия в
+- 22 таблицы + FTS5-таблица `knowledge_nodes_fts`; миграции 001–015, версия в
   `schema_version`.
 - Batch-очередь: `batchSize` (default 10), flush каждые 5 с; при ошибке batch
   выполняется построчная запись, «отравленные» строки логируются, очередь не

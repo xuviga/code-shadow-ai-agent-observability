@@ -62,6 +62,7 @@ import { migrateV011KnowledgeFts } from "./migrations/011_knowledge_fts";
 import { migrateV012EventTaxonomy } from "./migrations/012_event_taxonomy";
 import { migrateV013ChangePassports } from "./migrations/013_change_passports";
 import { migrateV014ToolTrust } from "./migrations/014_tool_trust";
+import { migrateV015Attestation } from "./migrations/015_attestation";
 import { pathMatches } from "./path-match";
 
 // ---------------------------------------------------------------------------
@@ -472,6 +473,7 @@ export class StorageEngine {
       { version: 12, description: "012 (tool_warning/turn_completed)", run: migrateV012EventTaxonomy },
       { version: 13, description: "013 (change passports и file claims)", run: migrateV013ChangePassports },
       { version: 14, description: "014 (tool trust fingerprints)", run: migrateV014ToolTrust },
+    { version: 15, description: "015 (passport attestation)", run: migrateV015Attestation },
     ];
 
     log.debug(`Текущая версия схемы: ${this.readSchemaVersion()}`);
@@ -991,6 +993,12 @@ export class StorageEngine {
       agent: row.agent, model: row.model, baseRef: row.base_ref,
       rollbackPlan: row.rollback_plan, reviewMd: row.review_md,
       hash: row.hash, prevHash: row.prev_hash,
+      attestation: row.attestation ?? null,
+      keyId: row.key_id ?? null,
+      signature: row.signature ?? null,
+      publicKey: row.public_key ?? null,
+      statementDigest: row.statement_digest ?? null,
+      signedAt: row.signed_at ?? null,
       createdAt: row.created_at, updatedAt: row.updated_at, sealedAt: row.sealed_at,
     }
   }
@@ -1420,7 +1428,7 @@ export class StorageEngine {
   // Change Passports и File Claims
   // =========================================================================
 
-  createPassport(input: Omit<ChangePassport, "id" | "createdAt" | "updatedAt" | "sealedAt" | "hash" | "prevHash"> & { id?: string }): ChangePassport {
+  createPassport(input: Omit<ChangePassport, "id" | "createdAt" | "updatedAt" | "sealedAt" | "hash" | "prevHash" | "attestation" | "keyId" | "signature" | "publicKey" | "statementDigest" | "signedAt"> & { id?: string }): ChangePassport {
     const now = Date.now(), id = input.id || crypto.randomUUID()
     // A passport created directly in a terminal state is sealed at creation;
     // updatePassport covers later draft -> sealed/blocked transitions.
@@ -1470,7 +1478,8 @@ export class StorageEngine {
   updatePassport(id: string, patch: Partial<Pick<ChangePassport,
     "status" | "riskScore" | "riskLevel" | "files" | "evidenceIds" | "checks" | "findings" |
     "budgetTokens" | "tokensUsed" | "allowDestructive" | "contractId" | "intent" | "reviewMd" |
-    "hash" | "prevHash" | "sealedAt" | "rollbackPlan" | "agent" | "model" | "baseRef"
+    "hash" | "prevHash" | "sealedAt" | "rollbackPlan" | "agent" | "model" | "baseRef" |
+    "attestation" | "keyId" | "signature" | "publicKey" | "statementDigest" | "signedAt"
   >>): ChangePassport | undefined {
     const columnMap: Record<string, string> = {
       status: "status", riskScore: "risk_score", riskLevel: "risk_level",
@@ -1479,6 +1488,8 @@ export class StorageEngine {
       allowDestructive: "allow_destructive", contractId: "contract_id", intent: "intent",
       reviewMd: "review_md", hash: "hash", prevHash: "prev_hash", sealedAt: "sealed_at",
       rollbackPlan: "rollback_plan", agent: "agent", model: "model", baseRef: "base_ref",
+      attestation: "attestation", keyId: "key_id", signature: "signature",
+      publicKey: "public_key", statementDigest: "statement_digest", signedAt: "signed_at",
     }
     const jsonFields = new Set(["files", "evidenceIds", "checks", "findings"])
     const fields: string[] = [], values: unknown[] = []

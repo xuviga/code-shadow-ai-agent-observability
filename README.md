@@ -31,6 +31,7 @@ declare success while the work is still incomplete.
 - **Definition of Done** — completion is guarded by steps, evidence, failures, contracts, and contradictions.
 - **Proof-Carrying Change** — every change can carry a sealed passport: intent, almost-right findings, evidence, contracts, destructive-command checks, file claims, token budget, hash-chain and a review packet.
 - **Tool trust registry** — MCP and tool descriptions/schemas are pinned; a changed fingerprint is a rug-pull signal, and suspicious descriptions are flagged.
+- **Signed change passports** — each sealed passport carries a DSSE envelope with an in-toto Statement and an Ed25519 signature; anyone can verify it with `node scripts/verify-passport.js` without the plugin or the database.
 - **TUI dashboard** — live project health and agent activity without sending code to a cloud service.
 
 ### Quick start
@@ -86,6 +87,7 @@ preventing normal iterative bug fixing.
 | [Implementation status](docs/IMPLEMENTATION_STATUS.md) | What is implemented and how it is verified |
 | [V2 compatibility](docs/V2_COMPATIBILITY.md) | OpenCode 2 events, packaging, TUI and AGENTS.md |
 | [Landscape](docs/LANDSCAPE.md) | What already exists in the world for these agent pain points, and where Code Shadow honestly stands |
+| [Attestation](docs/ATTESTATION.md) | DSSE + in-toto + Ed25519 passport signing, key management, verification, threat model |
 | [Upgrading](docs/UPGRADE.md) | Reload, doctor, lockfile and V1 package-root migration |
 | [Roadmap](docs/ROADMAP.md) | Planned product direction |
 | [Contributing](CONTRIBUTING.md) | Development workflow and pull-request standards |
@@ -953,7 +955,7 @@ Observer: session.compacted
 
 - [x] Базовая структура плагина (`index.ts`, `package.json`, `tsconfig.json`)
 - [x] Подключение к OpenCode Plugin SDK (`@opencode-ai/plugin`)
-- [x] Схема БД: 22 таблицы после миграции v14 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`, `change_passports`, `file_claims`, `tool_trust`) + FTS5-таблица `knowledge_nodes_fts`
+- [x] Схема БД: 22 таблицы после миграции v15 (`schema_version`, `file_edits`, `sessions`, `session_errors`, `tool_executions`, `decisions`, `knowledge_nodes`, `knowledge_edges`, `developer_events`, `analytics_cache`, `todos`, `agent_tasks`, `task_steps`, `evidence_records`, `failure_memory`, `change_contracts`, `contradiction_records`, `provenance_events`, `agent_handoffs`, `change_passports`, `file_claims`, `tool_trust`) + FTS5-таблица `knowledge_nodes_fts`
 - [x] Подписка на событие `file.edited` (прямой именованный хук + авто-детект фактов)
 - [x] Подписка на событие `session.created` / `session.idle` / `session.error` / `session.compacted`
 - [x] Подписка на событие `tool.execute.before` / `tool.execute.after`

@@ -12,7 +12,7 @@
   developer events, todo-изменения, LSP-диагностику и автоматически найденные
   факты.
 - Storage работает на `bun:sqlite`, включает WAL, batch-запись и миграции до
-  версии 14. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
+  версии 15. Ошибка миграции завершает инициализацию fail-fast, а не оставляет
   плагин на полусхеме. Миграция 010 закрепляет natural-key уникальность
   `knowledge_nodes` (file — по `path`, остальные — по `name`, в рамках проекта),
   миграция 011 добавляет FTS5-индекс и триггеры синхронизации памяти,
@@ -76,6 +76,11 @@
   hash-chain и review Markdown. `seal` блокирует при отсутствии evidence,
   нарушениях контракта, claim-конфликтах или critical/error findings;
   Definition of Done требует `sealed`, если паспорт создан.
+- Каждый sealed-паспорт подписывается локальным Ed25519-ключом и упаковывается
+  в DSSE-envelope с in-toto Statement; публичный ключ едет внутри конверта,
+  поэтому `node scripts/verify-passport.js` проверяет изменение без плагина,
+  БД и сети. `passportSignaturePolicy` (`require` по умолчанию) блокирует
+  паспорт без подписи, а `verify` различает `valid`/`stale`/`tampered`/`unsigned`.
 - Один блок автономных правил пишется в `~/.config/opencode/CRUSH.md`
   (OpenCode 1) и `~/.config/opencode/AGENTS.md` (OpenCode 2); пользовательский
   текст вне маркеров сохраняется, повторный refresh не дублирует блок.
@@ -109,7 +114,7 @@ bun test
 
 `npm run typecheck` проверяет TypeScript без генерации файлов, а
 `npm run typecheck:tui` — отдельную TUI-панель через `tsconfig.tui.json` и
-ambient-шимы хоста. `bun test` запускает **146 тестов** (13 файлов), включая
+ambient-шимы хоста. `bun test` запускает **158 тестов** (14 файлов), включая
 entrypoint smoke-тест плагина, V2 setup/event-тесты, regression-тесты на
 реальные payload'ы SDK 1.18.x, V2-трансляцию событий, TUI event-контракт,
 glob-контракты с `./`/`..`, индексатор импортов, project-scope агрегаты,

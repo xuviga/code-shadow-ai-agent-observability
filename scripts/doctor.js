@@ -227,10 +227,10 @@ async function checkDatabase() {
     }
 
     if (schemaChecked) {
-      if (Number.isInteger(schemaVersion) && schemaVersion >= 14) {
-        pass(`shadow DB schema version is ${schemaVersion} (expected >= 14)`)
+      if (Number.isInteger(schemaVersion) && schemaVersion >= 15) {
+        pass(`shadow DB schema version is ${schemaVersion} (expected >= 15)`)
       } else {
-        fail(`shadow DB schema version is ${schemaVersion ?? "missing"}, expected >= 14`)
+        fail(`shadow DB schema version is ${schemaVersion ?? "missing"}, expected >= 15`)
       }
     }
 
@@ -300,6 +300,24 @@ async function checkDatabase() {
       }
     } catch (error) {
       fail(`tool_trust check failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    try {
+      const sealed = count(
+        "SELECT COUNT(*) AS n FROM change_passports WHERE status = 'sealed'",
+      )
+      const signed = count(
+        "SELECT COUNT(*) AS n FROM change_passports WHERE status = 'sealed' AND attestation IS NOT NULL",
+      )
+      const keyPath = join(dirname(dbPath), "keys", "passport-signing-key.pem")
+      const keyExists = existsSync(keyPath)
+      if (sealed > 0 && signed < sealed) {
+        warn(`${sealed - signed} sealed passport(s) without an attestation (of ${sealed})`)
+      } else {
+        pass(`${signed}/${sealed} sealed passport(s) signed, key ${keyExists ? "present" : "missing"}`)
+      }
+    } catch (error) {
+      fail(`passport attestation check failed: ${error instanceof Error ? error.message : String(error)}`)
     }
 
     try {

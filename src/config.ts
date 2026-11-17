@@ -28,6 +28,7 @@ export const DEFAULT_CONFIG: ShadowConfig = {
   toolTrustPolicy: "warn",
   fileClaimPolicy: "block",
   fileClaimStaleMs: 5 * 60 * 1000,
+  passportSignaturePolicy: "require",
   secretPatterns: [
     // .env файлы
     "(?:^|\\W)DB_(?:PASSWORD|USER|NAME|HOST|PORT|URL)\\s*=\\s*\\S+",
@@ -164,6 +165,8 @@ export function loadConfig(
       userConfig.fileClaimPolicy ?? DEFAULT_CONFIG.fileClaimPolicy,
     fileClaimStaleMs:
       userConfig.fileClaimStaleMs ?? DEFAULT_CONFIG.fileClaimStaleMs,
+    passportSignaturePolicy:
+      userConfig.passportSignaturePolicy ?? DEFAULT_CONFIG.passportSignaturePolicy,
   };
 
   return merged;
@@ -208,6 +211,16 @@ function normalizeUserConfig(
     result.fileClaimPolicy = raw.fileClaimPolicy;
   if (typeof raw.fileClaimStaleMs === "number" && raw.fileClaimStaleMs > 0)
     result.fileClaimStaleMs = raw.fileClaimStaleMs;
+  if (typeof raw.signingKeyDir === "string" && raw.signingKeyDir.trim())
+    result.signingKeyDir = raw.signingKeyDir;
+  if (typeof raw.signingKeyPath === "string" && raw.signingKeyPath.trim())
+    result.signingKeyPath = raw.signingKeyPath;
+  if (
+    raw.passportSignaturePolicy === "require" ||
+    raw.passportSignaturePolicy === "warn" ||
+    raw.passportSignaturePolicy === "off"
+  )
+    result.passportSignaturePolicy = raw.passportSignaturePolicy;
 
   return result;
 }

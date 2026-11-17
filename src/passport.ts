@@ -603,6 +603,11 @@ export function buildReviewMarkdown(passport: ChangePassport): string {
   lines.push(`- **Base ref:** ${passport.baseRef ?? "—"}`)
   lines.push(`- **Sealed:** ${formatDate(passport.sealedAt)}`)
   lines.push(`- **Hash:** \`${shortHash(passport.hash)}\`  (prev: \`${shortHash(passport.prevHash)}\`)`)
+  lines.push(
+    passport.keyId
+      ? `- **Signature:** Ed25519 \`${passport.keyId}\` (DSSE/in-toto, ${formatDate(passport.signedAt)})`
+      : "- **Signature:** — (unsigned)",
+  )
   lines.push(`- **Tokens:** ${passport.tokensUsed}${passport.budgetTokens !== null ? ` / ${passport.budgetTokens}` : ""}`)
   lines.push("")
 

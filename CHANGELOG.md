@@ -6,6 +6,14 @@ All notable changes to Code Shadow are documented here.
 
 ### Added
 
+- **Signed change passports (DSSE + in-toto + Ed25519)**: `seal` now produces
+  a portable attestation — an in-toto Statement inside a DSSE envelope, signed
+  with a local Ed25519 key. The public key travels with the envelope, so
+  `scripts/verify-passport.js` verifies a change without the plugin, the
+  database or the network. `passportSignaturePolicy` (`require`/`warn`/`off`)
+  gates unsigned passports; `verify` distinguishes `valid`, `stale`, `tampered`
+  and `unsigned`; `attest` re-signs existing passports; `export` adds
+  `.att.json` and `.intoto.jsonl` (migration 015).
 - **Tool trust registry**: `code_shadow_tool_trust` (18th tool) pins MCP and
   tool descriptions/schemas, flags prompt-injection heuristics, detects
   rug pulls when a fingerprint changes after pinning, and enforces
